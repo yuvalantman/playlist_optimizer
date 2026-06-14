@@ -8,6 +8,13 @@ import pandas as pd
 class OutputWriter:
     """Write single-run playlist outputs into the project output folders."""
 
+    OFFICIAL_METRIC_DIRECTIONS = {
+        "arc_rmse": "lower",
+        "total_transition_cost": "lower",
+        "average_transition_cost": "lower",
+        "global_coherence": "higher",
+    }
+
     PLAYLIST_COLUMNS = [
         "position",
         "track_index",
@@ -20,6 +27,16 @@ class OutputWriter:
         "camelot",
         "energy",
         "valence",
+    ]
+    OPTIONAL_PLAYLIST_COLUMNS = [
+        "key",
+        "mode",
+        "time_signature",
+        "loudness",
+        "acousticness",
+        "instrumentalness",
+        "liveness",
+        "speechiness",
     ]
 
     def __init__(
@@ -62,7 +79,12 @@ class OutputWriter:
             missing = ", ".join(sorted(missing_columns))
             raise ValueError(f"Track pool is missing output columns: {missing}")
 
-        playlist_frame = track_pool.loc[playlist, metadata_columns].copy()
+        output_columns = metadata_columns + [
+            column
+            for column in self.OPTIONAL_PLAYLIST_COLUMNS
+            if column in track_pool.columns
+        ]
+        playlist_frame = track_pool.loc[playlist, output_columns].copy()
         playlist_frame.insert(0, "track_index", playlist)
         playlist_frame.insert(0, "position", range(len(playlist)))
 
@@ -75,22 +97,40 @@ class OutputWriter:
         greedy_metrics: dict,
         bibs_metrics: dict,
         output_path: str,
+        anchor_alignment_cost: float | None = None,
     ) -> None:
-        """Save matching Greedy and BIBS metrics with improvements."""
-        if set(greedy_metrics) != set(bibs_metrics):
-            raise ValueError("Greedy and BIBS metric dictionaries must match.")
-
-        comparison = pd.DataFrame(
-            {
-                "metric": list(greedy_metrics),
-                "greedy": list(greedy_metrics.values()),
-                "bibs": [
-                    bibs_metrics[metric]
-                    for metric in greedy_metrics
-                ],
-            }
-        )
-        comparison["improvement"] = comparison["greedy"] - comparison["bibs"]
+        """Save direction-aware official metric comparisons."""
+        rows: list[dict[str, object]] = []
+        for metric, better_when in self.OFFICIAL_METRIC_DIRECTIONS.items():
+            if metric not in greedy_metrics or metric not in bibs_metrics:
+                continue
+            greedy_value = float(greedy_metrics[metric])
+            bibs_value = float(bibs_metrics[metric])
+            improvement = (
+                greedy_value - bibs_value
+                if better_when == "lower"
+                else bibs_value - greedy_value
+            )
+            rows.append(
+                {
+                    "metric": metric,
+                    "greedy": greedy_value,
+                    "bibs": bibs_value,
+                    "improvement": improvement,
+                    "better_when": better_when,
+                }
+            )
+        if anchor_alignment_cost is not None:
+            rows.append(
+                {
+                    "metric": "anchor_alignment_cost",
+                    "greedy": float("nan"),
+                    "bibs": float(anchor_alignment_cost),
+                    "improvement": float("nan"),
+                    "better_when": "lower",
+                }
+            )
+        comparison = pd.DataFrame(rows)
 
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +144,7 @@ class OutputWriter:
         greedy_metrics: dict,
         bibs_metrics: dict,
         run_name: str = "single_run",
+        anchor_alignment_cost: float | None = None,
     ) -> dict[str, Path]:
         """Save both playlists and their metric comparison."""
         greedy_path = self.playlists_directory / f"{run_name}_greedy_playlist.csv"
@@ -118,6 +159,7 @@ class OutputWriter:
             greedy_metrics,
             bibs_metrics,
             str(comparison_path),
+            anchor_alignment_cost=anchor_alignment_cost,
         )
         return {
             "greedy_playlist": greedy_path.resolve(),

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from src.transition_graph import TransitionGraphData
+
 
 @dataclass(frozen=True)
 class GreedyBaselineConfig:
@@ -65,7 +67,7 @@ class GreedyPlaylistBaseline:
         c_arc: np.ndarray,
         c_trans: np.ndarray,
         previous_track: int | None,
-        transition_graph: dict[int, list[int]] | None,
+        transition_graph: dict[int, list[int]] | TransitionGraphData | None,
     ) -> int:
         candidates = available_tracks
         if (
@@ -73,8 +75,13 @@ class GreedyPlaylistBaseline:
             and self.config.use_transition_graph
             and transition_graph is not None
         ):
+            outgoing_neighbors = (
+                transition_graph.outgoing_neighbors
+                if isinstance(transition_graph, TransitionGraphData)
+                else transition_graph
+            )
             graph_candidates = available_tracks.intersection(
-                transition_graph.get(previous_track, [])
+                outgoing_neighbors.get(previous_track, [])
             )
             if graph_candidates:
                 candidates = graph_candidates
@@ -96,7 +103,7 @@ class GreedyPlaylistBaseline:
         c_trans: np.ndarray,
         start_index: int | None = None,
         end_index: int | None = None,
-        transition_graph: dict[int, list[int]] | None = None,
+        transition_graph: dict[int, list[int]] | TransitionGraphData | None = None,
     ) -> list[int]:
         """Return a greedy playlist containing every track exactly once."""
         number_of_tracks = self._validate_inputs(

@@ -5,6 +5,51 @@ from dataclasses import dataclass
 import numpy as np
 
 
+def validate_bottleneck_results(
+    bottleneck_results: dict,
+    number_of_tracks: int,
+    playlist_length: int,
+) -> None:
+    """Validate the complete bottleneck-detector output contract."""
+    required_keys = {
+        "song_bottleneck_scores",
+        "location_bottleneck_scores",
+        "bottleneck_track_indices",
+        "candidate_sets",
+    }
+    missing_keys = required_keys.difference(bottleneck_results)
+    if missing_keys:
+        missing = ", ".join(sorted(missing_keys))
+        raise ValueError(f"bottleneck_results is missing keys: {missing}")
+
+    song_scores = np.asarray(bottleneck_results["song_bottleneck_scores"])
+    location_scores = np.asarray(bottleneck_results["location_bottleneck_scores"])
+    bottleneck_indices = np.asarray(bottleneck_results["bottleneck_track_indices"])
+    candidate_sets = bottleneck_results["candidate_sets"]
+    if song_scores.shape != (number_of_tracks,) or not np.isfinite(song_scores).all():
+        raise ValueError("song_bottleneck_scores must match number_of_tracks.")
+    if (
+        location_scores.shape != (playlist_length,)
+        or not np.isfinite(location_scores).all()
+    ):
+        raise ValueError("location_bottleneck_scores must match playlist_length.")
+    if bottleneck_indices.ndim != 1 or any(
+        not 0 <= int(index) < number_of_tracks for index in bottleneck_indices
+    ):
+        raise ValueError("bottleneck_track_indices contains invalid indices.")
+    if not isinstance(candidate_sets, dict) or set(candidate_sets) != set(
+        range(playlist_length)
+    ):
+        raise ValueError("candidate_sets must contain every playlist position.")
+    for candidates in candidate_sets.values():
+        if any(
+            not isinstance(index, (int, np.integer))
+            or not 0 <= int(index) < number_of_tracks
+            for index in candidates
+        ):
+            raise ValueError("candidate_sets contains invalid track indices.")
+
+
 @dataclass(frozen=True)
 class BottleneckConfig:
     """Configuration for bottleneck scoring and candidate-set construction."""

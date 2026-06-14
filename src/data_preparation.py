@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -14,8 +15,8 @@ class TrackPoolConfig:
     genre: str | None = None
     pool_size: int = 300
     random_seed: int = 42
-    min_tempo: float = 1.0
-    max_tempo: float = 300.0
+    min_tempo: float | None = None
+    max_tempo: float | None = None
     remove_duplicate_track_ids: bool = True
     remove_duplicate_songs: bool = True
 
@@ -30,9 +31,15 @@ class TrackPoolBuilder:
     def _validate_config(self) -> None:
         if self.config.pool_size <= 0:
             raise ValueError("pool_size must be greater than zero.")
-        if self.config.min_tempo <= 0:
+        if self.config.min_tempo is not None and self.config.min_tempo <= 0:
             raise ValueError("min_tempo must be greater than zero.")
-        if self.config.max_tempo < self.config.min_tempo:
+        if self.config.max_tempo is not None and self.config.max_tempo <= 0:
+            raise ValueError("max_tempo must be greater than zero.")
+        if (
+            self.config.min_tempo is not None
+            and self.config.max_tempo is not None
+            and self.config.max_tempo < self.config.min_tempo
+        ):
             raise ValueError("max_tempo must be greater than or equal to min_tempo.")
 
     def load(self) -> pd.DataFrame:
@@ -64,14 +71,11 @@ class TrackPoolBuilder:
             df = df[df["track_genre"].astype(str).str.casefold() == genre]
 
         df["tempo"] = pd.to_numeric(df["tempo"], errors="coerce")
-        valid_tempo = (
-            df["tempo"].notna()
-            & df["tempo"].between(
-                self.config.min_tempo,
-                self.config.max_tempo,
-                inclusive="both",
-            )
-        )
+        valid_tempo = df["tempo"].notna() & np.isfinite(df["tempo"]) & (df["tempo"] > 0)
+        if self.config.min_tempo is not None:
+            valid_tempo &= df["tempo"] >= self.config.min_tempo
+        if self.config.max_tempo is not None:
+            valid_tempo &= df["tempo"] <= self.config.max_tempo
         df = df.loc[valid_tempo]
 
         if self.config.remove_duplicate_track_ids:

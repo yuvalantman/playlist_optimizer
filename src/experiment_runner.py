@@ -12,9 +12,13 @@ from src.data_preparation import TrackPoolBuilder, TrackPoolConfig
 from src.evaluator import EvaluationConfig, PlaylistEvaluator
 from src.feature_engineering import (
     EnergyValenceConfig,
+    StartEndSelectionConfig,
     compute_arc_cost_matrix,
     compute_ev_score,
-    create_linear_target_arc,
+    create_target_tempo_arc_from_tracks,
+    create_target_arc_from_tracks,
+    create_tempo_envelope_from_tracks,
+    select_start_end_tracks,
 )
 from src.greedy_baseline import GreedyBaselineConfig, GreedyPlaylistBaseline
 from src.transition_graph import TransitionGraphBuilder, TransitionGraphConfig
@@ -41,26 +45,28 @@ class ExperimentRunner:
         "arc_rmse",
         "total_transition_cost",
         "average_transition_cost",
-        "tail_transition_cost",
-        "average_tail_transition_cost",
+        "global_coherence",
     )
     IMPROVEMENT_NAMES = (
         "arc_rmse_improvement",
+        "total_transition_improvement",
         "average_transition_improvement",
-        "tail_transition_improvement",
+        "global_coherence_improvement",
     )
     WIN_NAMES = (
         "bibs_wins_arc_rmse",
         "bibs_wins_average_transition",
-        "bibs_wins_tail_transition",
-        "bibs_wins_all_three",
+        "bibs_wins_global_coherence",
+        "bibs_wins_all_official_metrics",
     )
+    BIBS_ONLY_METRIC_NAMES = ("anchor_alignment_cost",)
     RESULT_COLUMNS = (
         "genre",
         "seed",
         "pool_size",
         *(f"greedy_{metric}" for metric in METRIC_NAMES),
         *(f"bibs_{metric}" for metric in METRIC_NAMES),
+        *(f"bibs_{metric}" for metric in BIBS_ONLY_METRIC_NAMES),
         *IMPROVEMENT_NAMES,
         *WIN_NAMES,
     )
@@ -82,36 +88,62 @@ class ExperimentRunner:
                 genre=genre,
                 pool_size=self.config.pool_size,
                 random_seed=seed,
-                min_tempo=40.0,
-                max_tempo=220.0,
             )
         ).build()
         track_pool = compute_ev_score(track_pool, EnergyValenceConfig())
-        target_arc = create_linear_target_arc(
-            len(track_pool),
-            self.config.target_arc_start,
-            self.config.target_arc_end,
+        c_trans = compute_transition_cost_matrix(track_pool)
+        start_index, end_index = select_start_end_tracks(
+            track_pool,
+            c_trans,
+            StartEndSelectionConfig(random_seed=seed),
+        )
+        _tempo_envelope = create_tempo_envelope_from_tracks(
+            track_pool,
+            start_index,
+            end_index,
+        )
+        _target_tempo_arc = create_target_tempo_arc_from_tracks(
+            track_pool,
+            start_index,
+            end_index,
+        )
+        target_arc = create_target_arc_from_tracks(
+            track_pool,
+            start_index,
+            end_index,
         )
         c_arc = compute_arc_cost_matrix(track_pool, target_arc)
-        c_trans = compute_transition_cost_matrix(track_pool)
         bottleneck_results = BottleneckDetector(BottleneckConfig()).detect(c_arc)
-        transition_graph = TransitionGraphBuilder(
+        graph_data = TransitionGraphBuilder(
             TransitionGraphConfig()
-        ).build_top_m_graph(c_trans)
+        ).build_transition_graph_data(c_trans)
 
         greedy_playlist = GreedyPlaylistBaseline(
             GreedyBaselineConfig()
-        ).generate(c_arc, c_trans, transition_graph=transition_graph)
-        bibs_playlist = BIBS(BIBSConfig()).generate(
+        ).generate(
+            c_arc,
+            c_trans,
+            start_index=start_index,
+            end_index=end_index,
+            transition_graph=graph_data,
+        )
+        bibs = BIBS(BIBSConfig())
+        bibs_playlist = bibs.generate(
             c_arc,
             c_trans,
             bottleneck_results,
-            transition_graph=transition_graph,
+            transition_graph=graph_data.outgoing_neighbors,
+            start_index=start_index,
+            end_index=end_index,
+            track_pool=track_pool,
         )
 
         evaluator = PlaylistEvaluator(EvaluationConfig())
         greedy_metrics = evaluator.evaluate(greedy_playlist, c_arc, c_trans)
         bibs_metrics = evaluator.evaluate(bibs_playlist, c_arc, c_trans)
+        bibs_anchor_alignment_cost = evaluator.compute_anchor_alignment_cost(
+            bibs.anchor_history
+        )
 
         result: dict[str, object] = {
             "genre": genre,
@@ -130,17 +162,21 @@ class ExperimentRunner:
                 for metric in self.METRIC_NAMES
             }
         )
+        result["bibs_anchor_alignment_cost"] = bibs_anchor_alignment_cost
 
         result["arc_rmse_improvement"] = (
             greedy_metrics["arc_rmse"] - bibs_metrics["arc_rmse"]
+        )
+        result["total_transition_improvement"] = (
+            greedy_metrics["total_transition_cost"]
+            - bibs_metrics["total_transition_cost"]
         )
         result["average_transition_improvement"] = (
             greedy_metrics["average_transition_cost"]
             - bibs_metrics["average_transition_cost"]
         )
-        result["tail_transition_improvement"] = (
-            greedy_metrics["average_tail_transition_cost"]
-            - bibs_metrics["average_tail_transition_cost"]
+        result["global_coherence_improvement"] = (
+            bibs_metrics["global_coherence"] - greedy_metrics["global_coherence"]
         )
         result["bibs_wins_arc_rmse"] = (
             bibs_metrics["arc_rmse"] < greedy_metrics["arc_rmse"]
@@ -149,16 +185,15 @@ class ExperimentRunner:
             bibs_metrics["average_transition_cost"]
             < greedy_metrics["average_transition_cost"]
         )
-        result["bibs_wins_tail_transition"] = (
-            bibs_metrics["average_tail_transition_cost"]
-            < greedy_metrics["average_tail_transition_cost"]
+        result["bibs_wins_global_coherence"] = (
+            bibs_metrics["global_coherence"] > greedy_metrics["global_coherence"]
         )
-        result["bibs_wins_all_three"] = all(
+        result["bibs_wins_all_official_metrics"] = all(
             result[win_name]
             for win_name in (
                 "bibs_wins_arc_rmse",
                 "bibs_wins_average_transition",
-                "bibs_wins_tail_transition",
+                "bibs_wins_global_coherence",
             )
         )
         return result
@@ -172,14 +207,15 @@ class ExperimentRunner:
                     "number_of_runs",
                     "arc_rmse_win_rate",
                     "average_transition_win_rate",
-                    "tail_transition_win_rate",
-                    "all_three_win_rate",
+                    "global_coherence_win_rate",
+                    "all_official_metrics_win_rate",
                 ]
             )
 
         mean_columns = [
             *(f"greedy_{metric}" for metric in self.METRIC_NAMES),
             *(f"bibs_{metric}" for metric in self.METRIC_NAMES),
+            *(f"bibs_{metric}" for metric in self.BIBS_ONLY_METRIC_NAMES),
             *self.IMPROVEMENT_NAMES,
         ]
         summary = (
@@ -194,11 +230,11 @@ class ExperimentRunner:
         summary["average_transition_win_rate"] = raw_results.groupby("genre")[
             "bibs_wins_average_transition"
         ].mean()
-        summary["tail_transition_win_rate"] = raw_results.groupby("genre")[
-            "bibs_wins_tail_transition"
+        summary["global_coherence_win_rate"] = raw_results.groupby("genre")[
+            "bibs_wins_global_coherence"
         ].mean()
-        summary["all_three_win_rate"] = raw_results.groupby("genre")[
-            "bibs_wins_all_three"
+        summary["all_official_metrics_win_rate"] = raw_results.groupby("genre")[
+            "bibs_wins_all_official_metrics"
         ].mean()
         return summary.reset_index()
 
