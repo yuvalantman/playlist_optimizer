@@ -11,7 +11,6 @@ from src.candidate_orchestrator import (
     CandidateOrchestrator,
     CandidateOrchestratorConfig,
 )
-from src.cost_functions import energy_momentum_penalty
 from src.transition_graph import (
     TransitionGraphBuilder,
     TransitionGraphConfig,
@@ -23,47 +22,23 @@ from src.transition_graph import (
 class BIBSConfig:
     """Configuration for Bottleneck-Guided Bidirectional Beam Search."""
 
-    beam_width: int = 8
+    # Number of partial paths retained during beam expansion.
+    beam_width: int = 4
+    # Number of positions processed per chunk during beam expansion progress.
+    beam_length: int = 3
+    # Recursion threshold where intervals switch to local base-case matching.
     base_case_size: int = 4
     max_recursion_depth: int = 30
     arc_weight: float = 1.0
     transition_weight: float = 1.0
     bottleneck_weight: float = 0.6
-    location_bottleneck_weight: float = 0.5
-    energy_momentum_weight: float = 1.0
-    harmonic_diversity_weight: float = 0.4
     anchor_arc_weight: float = 1.0
     anchor_transition_weight: float = 1.2
     anchor_bottleneck_weight: float = 0.6
-    anchor_location_bottleneck_weight: float = 0.5
-    anchor_energy_momentum_weight: float = 1.0
-    base_arc_weight: float = 0.4
-    base_transition_weight: float = 1.4
-    base_energy_momentum_weight: float = 1.0
-    harmonic_window: int = 8
-    max_same_camelot_in_window: int = 3
-    max_same_camelot_number_in_window: int = 4
-    harmonic_stagnation_penalty: float = 0.3
-    high_energy_threshold: float = 0.65
-    allowed_ev_drop: float = 0.08
-    ev_drop_weight: float = 2.0
-    max_preferred_camelot_jump: int = 2
-    large_camelot_jump_penalty: float = 0.8
-    extreme_camelot_jump_penalty: float = 1.5
-    enable_harmonic_motion_penalty: bool = True
-    high_arc_threshold: float = 0.65
-    max_allowed_arc_deviation_high_energy: float = 0.15
-    high_energy_arc_penalty_weight: float = 3.0
-    high_energy_drop_penalty_weight: float = 3.0
-    late_position_fraction: float = 0.70
-    late_low_ev_penalty_weight: float = 3.0
-    feasibility_penalty_weight: float = 1.0
-    min_candidates_per_position: int = 4
-    base_case_extra_candidates_per_position: int = 4
+    anchor_balance_weight: float = 0.3
+    base_arc_weight: float = 0.3
+    base_transition_weight: float = 1.5
     base_case_max_candidates: int = 12
-    bad_transition_threshold: float = 1.5
-    bad_transition_penalty_weight: float = 1.2
-    base_high_energy_penalty_weight: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -75,11 +50,7 @@ class _BeamItem:
     arc_component: float = 0.0
     transition_component: float = 0.0
     bottleneck_component: float = 0.0
-    location_bottleneck_component: float = 0.0
-    energy_momentum_component: float = 0.0
-    harmonic_diversity_component: float = 0.0
-    harmonic_motion_component: float = 0.0
-    feasibility_component: float = 0.0
+    balance_component: float = 0.0
 
 
 class BIBS:
@@ -89,11 +60,7 @@ class BIBS:
         "arc_component",
         "transition_component",
         "bottleneck_component",
-        "location_bottleneck_component",
-        "energy_momentum_component",
-        "harmonic_diversity_component",
-        "harmonic_motion_component",
-        "feasibility_component",
+        "balance_component",
     )
 
     DIAGNOSTIC_NAMES = (
@@ -104,22 +71,19 @@ class BIBS:
         "backward_beam_expansions",
         "candidate_orchestrator_calls",
         "selected_bottleneck_anchors",
-        "energy_momentum_penalties_applied",
-        "harmonic_penalties_applied",
-        "harmonic_motion_penalties_applied",
         "base_case_forced_assignment_count",
-        "high_energy_arc_penalties_applied",
-        "late_low_ev_penalties_applied",
-        "feasibility_penalties_applied",
         "anchors_with_arc_cost_above_0_25",
         "anchors_with_arc_cost_above_0_35",
-        "final_repair_swaps",
     )
 
     def __init__(self, config: BIBSConfig) -> None:
         self.config = config
         self.anchor_history: list[dict] = []
         self.decision_trace: list[dict] = []
+        self.recursion_trace: list[dict] = []
+        self.beam_trace: list[dict] = []
+        self.anchor_selection_trace: list[dict] = []
+        self.base_case_trace: list[dict] = []
         self._diagnostics: dict[str, int | float | bool] = {}
         self._anchor_score_total = 0.0
         self._ev_scores = np.asarray([], dtype=float)
@@ -131,14 +95,9 @@ class BIBS:
     def _validate_config(self) -> None:
         integer_fields = (
             "beam_width",
+            "beam_length",
             "base_case_size",
             "max_recursion_depth",
-            "harmonic_window",
-            "max_same_camelot_in_window",
-            "max_same_camelot_number_in_window",
-            "max_preferred_camelot_jump",
-            "min_candidates_per_position",
-            "base_case_extra_candidates_per_position",
             "base_case_max_candidates",
         )
         for name in integer_fields:
@@ -148,43 +107,16 @@ class BIBS:
             "arc_weight",
             "transition_weight",
             "bottleneck_weight",
-            "location_bottleneck_weight",
-            "energy_momentum_weight",
-            "harmonic_diversity_weight",
             "anchor_arc_weight",
             "anchor_transition_weight",
             "anchor_bottleneck_weight",
-            "anchor_location_bottleneck_weight",
-            "anchor_energy_momentum_weight",
+            "anchor_balance_weight",
             "base_arc_weight",
             "base_transition_weight",
-            "base_energy_momentum_weight",
-            "harmonic_stagnation_penalty",
-            "ev_drop_weight",
-            "large_camelot_jump_penalty",
-            "extreme_camelot_jump_penalty",
-            "high_energy_arc_penalty_weight",
-            "high_energy_drop_penalty_weight",
-            "late_low_ev_penalty_weight",
-            "feasibility_penalty_weight",
-            "bad_transition_penalty_weight",
-            "base_high_energy_penalty_weight",
         )
         for name in weight_fields:
             if getattr(self.config, name) < 0:
                 raise ValueError(f"{name} must be non-negative.")
-        if self.config.allowed_ev_drop < 0:
-            raise ValueError("allowed_ev_drop must be non-negative.")
-        for name in (
-            "high_arc_threshold",
-            "max_allowed_arc_deviation_high_energy",
-            "late_position_fraction",
-        ):
-            value = getattr(self.config, name)
-            if not 0 <= value <= 1:
-                raise ValueError(f"{name} must be between 0 and 1.")
-        if self.config.bad_transition_threshold < 0:
-            raise ValueError("bad_transition_threshold must be non-negative.")
         if self.config.base_case_max_candidates < self.config.base_case_size:
             raise ValueError(
                 "base_case_max_candidates cannot be smaller than base_case_size."
@@ -193,16 +125,15 @@ class BIBS:
     def _reset_state(self) -> None:
         self.anchor_history = []
         self.decision_trace = []
+        self.recursion_trace = []
+        self.beam_trace = []
+        self.anchor_selection_trace = []
+        self.base_case_trace = []
         self._diagnostics = {name: 0 for name in self.DIAGNOSTIC_NAMES}
         self._diagnostics["graph_used"] = False
         self._diagnostics["bottleneck_results_used"] = False
         self._diagnostics["base_case_candidate_count_total"] = 0.0
         self._diagnostics["worst_base_case_transition_component"] = 0.0
-        self._diagnostics["feasibility_penalty_total"] = 0.0
-        self._diagnostics["late_energy_penalty_total"] = 0.0
-        self._diagnostics["late_energy_penalty_count"] = 0
-        self._diagnostics["final_repair_transition_improvement"] = 0.0
-        self._diagnostics["final_repair_harmonic_increase"] = 0.0
         for component in self.SCORE_COMPONENT_NAMES:
             self._diagnostics[f"total_{component}"] = 0.0
         self._anchor_score_total = 0.0
@@ -237,11 +168,6 @@ class BIBS:
         return float(np.clip(float(value), 0.0, 2.5))
 
     @staticmethod
-    def _normalize_energy_momentum(value: float) -> float:
-        """Scale energy-momentum penalties into a visible bounded range."""
-        return float(np.clip(float(value), 0.0, 1.0))
-
-    @staticmethod
     def _normalize_bottleneck_score(value: float) -> float:
         """Scale bottleneck difficulty into a useful bounded bonus range."""
         return float(np.clip(float(value), 0.0, 1.0))
@@ -249,264 +175,10 @@ class BIBS:
     def _bottleneck_bonus(
         self,
         score: float,
-        arc_cost: float,
         weight: float,
     ) -> float:
-        """Return a fit-gated negative bonus for a difficult track."""
-        if arc_cost <= 0.20:
-            fit_multiplier = 1.0
-        elif arc_cost <= 0.35:
-            fit_multiplier = 0.5
-        else:
-            fit_multiplier = 0.0
-        return float(
-            -weight
-            * fit_multiplier
-            * self._normalize_bottleneck_score(score)
-        )
-
-    def _late_energy_penalty(
-        self,
-        candidate: int,
-        previous_track: int,
-        position: int,
-        target_arc: np.ndarray,
-        track_pool: pd.DataFrame,
-        c_arc: np.ndarray,
-    ) -> float:
-        """Penalize low-EV or poor-arc placements in late/high-energy regions."""
-        del track_pool
-        target_value = float(target_arc[position])
-        is_late = position >= int(len(target_arc) * self.config.late_position_fraction)
-        if not is_late and target_value < self.config.high_arc_threshold:
-            return 0.0
-
-        arc_excess = max(
-            0.0,
-            float(c_arc[candidate, position])
-            - self.config.max_allowed_arc_deviation_high_energy,
-        )
-        low_ev_excess = max(
-            0.0,
-            target_value
-            - float(self._ev_scores[candidate])
-            - self.config.max_allowed_arc_deviation_high_energy,
-        )
-        drop_excess = max(
-            0.0,
-            float(self._ev_scores[previous_track])
-            - float(self._ev_scores[candidate])
-            - self.config.allowed_ev_drop,
-        )
-        if arc_excess > 0:
-            self._diagnostics["high_energy_arc_penalties_applied"] += 1
-        if low_ev_excess > 0:
-            self._diagnostics["late_low_ev_penalties_applied"] += 1
-        penalty = (
-            self.config.high_energy_arc_penalty_weight * arc_excess
-            + self.config.late_low_ev_penalty_weight * low_ev_excess
-            + self.config.high_energy_drop_penalty_weight * drop_excess
-        )
-        if penalty > 0:
-            self._diagnostics["late_energy_penalty_total"] += float(penalty)
-            self._diagnostics["late_energy_penalty_count"] += 1
-        return float(penalty)
-
-    def _estimate_subinterval_feasibility(
-        self,
-        left_pos: int,
-        right_pos: int,
-        available_tracks: set[int],
-        c_arc: np.ndarray,
-        bottleneck_results: dict,
-        target_arc: np.ndarray,
-        track_pool: pd.DataFrame,
-    ) -> tuple[float, dict[str, float]]:
-        """Estimate whether remaining tracks can reasonably fill an interval."""
-        del track_pool
-        positions = list(range(left_pos + 1, right_pos))
-        if not positions:
-            return 0.0
-        available = np.asarray(sorted(available_tracks), dtype=int)
-        if len(available) < len(positions):
-            return float(len(positions) - len(available) + 1)
-
-        candidate_sets = bottleneck_results["candidate_sets"]
-        penalty = 0.0
-        for position in positions:
-            candidate_count = sum(
-                candidate in available_tracks
-                for candidate in candidate_sets[position]
-            )
-            penalty += max(
-                0,
-                self.config.min_candidates_per_position - candidate_count,
-            ) / self.config.min_candidates_per_position
-            closest_arc = float(np.min(c_arc[available, position]))
-            penalty += max(
-                0.0,
-                closest_arc - self.config.max_allowed_arc_deviation_high_energy,
-            )
-            if (
-                position >= int(len(target_arc) * self.config.late_position_fraction)
-                or target_arc[position] >= self.config.high_arc_threshold
-            ):
-                high_enough = np.count_nonzero(
-                    self._ev_scores[available]
-                    >= target_arc[position]
-                    - self.config.max_allowed_arc_deviation_high_energy
-                )
-                penalty += max(0, 1 - high_enough)
-        return float(penalty / len(positions))
-
-    @staticmethod
-    def _local_transition_total(
-        playlist: list[int],
-        positions: set[int],
-        c_trans: np.ndarray,
-    ) -> float:
-        edge_positions = {
-            edge
-            for position in positions
-            for edge in (position - 1, position)
-            if 0 <= edge < len(playlist) - 1
-        }
-        return float(
-            sum(
-                c_trans[playlist[edge], playlist[edge + 1]]
-                for edge in edge_positions
-            )
-        )
-
-    def _large_drop_severity(
-        self,
-        playlist: list[int],
-        positions: set[int],
-    ) -> float:
-        edge_positions = {
-            edge
-            for position in positions
-            for edge in (position - 1, position)
-            if 0 <= edge < len(playlist) - 1
-        }
-        return float(
-            sum(
-                max(
-                    0.0,
-                    self._ev_scores[playlist[edge]]
-                    - self._ev_scores[playlist[edge + 1]]
-                    - 0.12,
-                )
-                for edge in edge_positions
-            )
-        )
-
-    def _harmonic_motion_severity(
-        self,
-        playlist: list[int],
-        positions: set[int],
-    ) -> float:
-        edge_positions = {
-            edge
-            for position in positions
-            for edge in (position - 1, position)
-            if 0 <= edge < len(playlist) - 1
-        }
-        severity = 0.0
-        for edge in edge_positions:
-            source = int(float(self._camelot_numbers[playlist[edge]]))
-            target = int(float(self._camelot_numbers[playlist[edge + 1]]))
-            direct = abs(source - target)
-            distance = min(direct, 12 - direct)
-            severity += max(0, distance - self.config.max_preferred_camelot_jump)
-        return float(severity)
-
-    def _final_repair(
-        self,
-        playlist: list[int],
-        c_arc: np.ndarray,
-        c_trans: np.ndarray,
-    ) -> list[int]:
-        """Deterministically improve final adjacency without worsening arc or EV drops."""
-        repaired = list(playlist)
-        total_improvement = 0.0
-        harmonic_increase_used = 0.0
-        for _ in range(2):
-            improved = False
-            for first in range(1, len(repaired) - 1):
-                best_swap: tuple[float, int, float] | None = None
-                for second in range(first + 1, len(repaired) - 1):
-                    positions = {first, second}
-                    old_transition = self._local_transition_total(
-                        repaired,
-                        positions,
-                        c_trans,
-                    )
-                    old_drop = self._large_drop_severity(repaired, positions)
-                    old_harmonic = self._harmonic_motion_severity(
-                        repaired,
-                        positions,
-                    )
-                    first_track = repaired[first]
-                    second_track = repaired[second]
-                    old_arc = (
-                        c_arc[first_track, first] ** 2
-                        + c_arc[second_track, second] ** 2
-                    )
-                    new_arc = (
-                        c_arc[second_track, first] ** 2
-                        + c_arc[first_track, second] ** 2
-                    )
-                    if new_arc > old_arc + 1e-12:
-                        continue
-                    repaired[first], repaired[second] = second_track, first_track
-                    new_transition = self._local_transition_total(
-                        repaired,
-                        positions,
-                        c_trans,
-                    )
-                    new_drop = self._large_drop_severity(repaired, positions)
-                    new_harmonic = self._harmonic_motion_severity(
-                        repaired,
-                        positions,
-                    )
-                    repaired[first], repaired[second] = first_track, second_track
-                    improvement = old_transition - new_transition
-                    harmonic_increase = max(0.0, new_harmonic - old_harmonic)
-                    if (
-                        improvement <= 1e-12
-                        or new_drop > old_drop + 1e-12
-                    ):
-                        continue
-                    repair_score = improvement - 0.15 * harmonic_increase
-                    key = (float(repair_score), float(improvement), -second)
-                    if best_swap is None:
-                        best_key = None
-                    else:
-                        best_key = (
-                            best_swap[0] - 0.15 * best_swap[2],
-                            best_swap[0],
-                            -best_swap[1],
-                        )
-                    if best_key is None or key > best_key:
-                        best_swap = (
-                            float(improvement),
-                            second,
-                            float(harmonic_increase),
-                        )
-                if best_swap is None:
-                    continue
-                improvement, second, harmonic_increase = best_swap
-                repaired[first], repaired[second] = repaired[second], repaired[first]
-                total_improvement += improvement
-                harmonic_increase_used += harmonic_increase
-                self._diagnostics["final_repair_swaps"] += 1
-                improved = True
-            if not improved:
-                break
-        self._diagnostics["final_repair_transition_improvement"] = total_improvement
-        self._diagnostics["final_repair_harmonic_increase"] = harmonic_increase_used
-        return repaired
+        """Return the methodology bottleneck priority bonus."""
+        return float(-weight * self._normalize_bottleneck_score(score))
 
     @staticmethod
     def _validate_inputs(
@@ -570,75 +242,6 @@ class BIBS:
             raise ValueError("start_index and end_index must be different.")
         return number_of_tracks
 
-    def _energy_penalty(
-        self,
-        previous_track: int,
-        candidate: int,
-        target_value: float,
-        track_pool: pd.DataFrame,
-    ) -> float:
-        penalty = energy_momentum_penalty(
-            float(self._ev_scores[previous_track]),
-            float(self._ev_scores[candidate]),
-            float(target_value),
-            high_energy_threshold=self.config.high_energy_threshold,
-            allowed_drop=self.config.allowed_ev_drop,
-            drop_weight=self.config.ev_drop_weight,
-        )
-        if penalty > 0:
-            self._diagnostics["energy_momentum_penalties_applied"] += 1
-        return penalty
-
-    def _harmonic_diversity_penalty(
-        self,
-        candidate: int,
-        recent_tracks: list[int] | tuple[int, ...],
-        track_pool: pd.DataFrame,
-    ) -> float:
-        context = list(recent_tracks)[-(self.config.harmonic_window - 1) :]
-        candidate_code = self._camelot_codes[candidate]
-        candidate_number = self._camelot_numbers[candidate]
-        numbers = [self._camelot_numbers[track] for track in context]
-        codes = [self._camelot_codes[track] for track in context]
-        code_count = codes.count(candidate_code) + 1
-        number_count = numbers.count(candidate_number) + 1
-        excess = max(0, code_count - self.config.max_same_camelot_in_window)
-        excess += max(
-            0,
-            number_count - self.config.max_same_camelot_number_in_window,
-        )
-        immediate_run = 0
-        for code in reversed(codes):
-            if code != candidate_code:
-                break
-            immediate_run += 1
-        excess += max(0, immediate_run - self.config.max_same_camelot_in_window + 1)
-        penalty = self.config.harmonic_stagnation_penalty * excess
-        if penalty > 0:
-            self._diagnostics["harmonic_penalties_applied"] += 1
-        return float(penalty)
-
-    def _harmonic_motion_penalty(
-        self,
-        source: int,
-        target: int,
-    ) -> float:
-        """Return a soft penalty for large circular Camelot-number jumps."""
-        if not self.config.enable_harmonic_motion_penalty:
-            return 0.0
-        source_number = int(float(self._camelot_numbers[source]))
-        target_number = int(float(self._camelot_numbers[target]))
-        direct = abs(source_number - target_number)
-        distance = min(direct, 12 - direct)
-        excess = distance - self.config.max_preferred_camelot_jump
-        if excess <= 0:
-            return 0.0
-        penalty = self.config.large_camelot_jump_penalty * excess
-        if distance >= 5:
-            penalty += self.config.extreme_camelot_jump_penalty * (distance - 4)
-        self._diagnostics["harmonic_motion_penalties_applied"] += 1
-        return float(penalty)
-
     def _expand_beam(
         self,
         boundary_track: int,
@@ -653,6 +256,7 @@ class BIBS:
         target_arc: np.ndarray,
         track_pool: pd.DataFrame,
     ) -> list[_BeamItem]:
+        del target_arc, track_pool
         beams = [
             _BeamItem(
                 path=(),
@@ -662,10 +266,20 @@ class BIBS:
             )
         ]
         song_scores = np.asarray(bottleneck_results["song_bottleneck_scores"])
-        location_scores = np.asarray(
-            bottleneck_results["location_bottleneck_scores"]
-        )
-        for position in positions:
+
+        def chunked_positions():
+            """Yield positions in beam_length-sized progress chunks."""
+            for chunk_index, chunk_start in enumerate(
+                range(0, len(positions), self.config.beam_length)
+            ):
+                chunk = positions[chunk_start : chunk_start + self.config.beam_length]
+                for position_index_in_chunk, chunk_position in enumerate(chunk):
+                    yield chunk_index, position_index_in_chunk, chunk_position
+
+        # beam_length controls chunked expansion progress; beam_width prunes
+        # surviving partial paths after each position.
+        for chunk_index, position_index_in_chunk, position in chunked_positions():
+            beams_before_expansion = len(beams)
             expanded: list[_BeamItem] = []
             for beam in beams:
                 beam_available = available_tracks.difference(beam.used)
@@ -691,41 +305,8 @@ class BIBS:
                 for candidate in candidates:
                     if direction == "forward":
                         transition = c_trans[beam.last_track, candidate]
-                        motion = self._harmonic_motion_penalty(
-                            beam.last_track,
-                            candidate,
-                        )
-                        energy = self._energy_penalty(
-                            beam.last_track,
-                            candidate,
-                            target_arc[position],
-                            track_pool,
-                        )
                     else:
                         transition = c_trans[candidate, beam.last_track]
-                        motion = self._harmonic_motion_penalty(
-                            candidate,
-                            beam.last_track,
-                        )
-                        energy = self._energy_penalty(
-                            candidate,
-                            beam.last_track,
-                            target_arc[min(position + 1, len(target_arc) - 1)],
-                            track_pool,
-                        )
-                    harmonic = self._harmonic_diversity_penalty(
-                        candidate,
-                        beam.path,
-                        track_pool,
-                    )
-                    late_energy = self._late_energy_penalty(
-                        candidate,
-                        beam.last_track,
-                        position,
-                        target_arc,
-                        track_pool,
-                        c_arc,
-                    )
                     normalized_arc = self._normalize_arc_cost(
                         c_arc[candidate, position]
                     )
@@ -740,33 +321,12 @@ class BIBS:
                     )
                     bottleneck_component = self._bottleneck_bonus(
                         song_scores[candidate],
-                        c_arc[candidate, position],
                         self.config.bottleneck_weight,
                     )
-                    location_bottleneck_component = (
-                        self.config.location_bottleneck_weight
-                        * self._normalize_bottleneck_score(location_scores[position])
-                        * normalized_arc
-                    )
-                    energy_momentum_component = (
-                        self.config.energy_momentum_weight
-                        * self._normalize_energy_momentum(energy)
-                        + late_energy
-                    )
-                    harmonic_diversity_component = (
-                        self.config.harmonic_diversity_weight * harmonic
-                    )
-                    harmonic_motion_component = motion
-                    feasibility_component = 0.0
                     local_score = (
                         arc_component
                         + transition_component
                         + bottleneck_component
-                        + location_bottleneck_component
-                        + energy_momentum_component
-                        + harmonic_diversity_component
-                        + harmonic_motion_component
-                        + feasibility_component
                     )
                     expanded.append(
                         _BeamItem(
@@ -783,26 +343,7 @@ class BIBS:
                             bottleneck_component=float(
                                 beam.bottleneck_component + bottleneck_component
                             ),
-                            location_bottleneck_component=float(
-                                beam.location_bottleneck_component
-                                + location_bottleneck_component
-                            ),
-                            energy_momentum_component=float(
-                                beam.energy_momentum_component
-                                + energy_momentum_component
-                            ),
-                            harmonic_diversity_component=float(
-                                beam.harmonic_diversity_component
-                                + harmonic_diversity_component
-                            ),
-                            harmonic_motion_component=float(
-                                beam.harmonic_motion_component
-                                + harmonic_motion_component
-                            ),
-                            feasibility_component=float(
-                                beam.feasibility_component
-                                + feasibility_component
-                            ),
+                            balance_component=float(beam.balance_component),
                         )
                     )
             if direction == "forward":
@@ -810,9 +351,39 @@ class BIBS:
             else:
                 self._diagnostics["backward_beam_expansions"] += len(expanded)
             if not expanded:
+                self.beam_trace.append(
+                    {
+                        "direction": direction,
+                        "position": position,
+                        "chunk_index": chunk_index,
+                        "position_index_in_chunk": position_index_in_chunk,
+                        "total_positions_in_call": len(positions),
+                        "beam_length": self.config.beam_length,
+                        "beam_width": self.config.beam_width,
+                        "beams_before_expansion": beams_before_expansion,
+                        "expanded_candidate_count": len(expanded),
+                        "beams_after_pruning": len(beams),
+                        "returned_early_due_to_no_expansion": True,
+                    }
+                )
                 return beams
             expanded.sort(key=lambda beam: (beam.score, beam.path))
             beams = expanded[: self.config.beam_width]
+            self.beam_trace.append(
+                {
+                    "direction": direction,
+                    "position": position,
+                    "chunk_index": chunk_index,
+                    "position_index_in_chunk": position_index_in_chunk,
+                    "total_positions_in_call": len(positions),
+                    "beam_length": self.config.beam_length,
+                    "beam_width": self.config.beam_width,
+                    "beams_before_expansion": beams_before_expansion,
+                    "expanded_candidate_count": len(expanded),
+                    "beams_after_pruning": len(beams),
+                    "returned_early_due_to_no_expansion": False,
+                }
+            )
         return beams
 
     def _select_anchor(
@@ -833,6 +404,7 @@ class BIBS:
         target_arc: np.ndarray,
         track_pool: pd.DataFrame,
     ) -> tuple[int, int, int, float, dict]:
+        del target_arc, track_pool
         self._diagnostics["candidate_orchestrator_calls"] += 1
         anchor_candidates = candidate_orchestrator.build_anchor_candidates(
             left_track,
@@ -848,34 +420,9 @@ class BIBS:
             raise ValueError("CandidateOrchestrator returned no anchor candidates.")
         candidate_sources = candidate_orchestrator.get_last_anchor_candidate_sources()
         song_scores = np.asarray(bottleneck_results["song_bottleneck_scores"])
-        location_scores = np.asarray(
-            bottleneck_results["location_bottleneck_scores"]
-        )
-        feasibility_by_anchor: dict[int, float] = {}
-        for anchor in anchor_candidates:
-            remaining = available_tracks.difference({anchor})
-            feasibility_by_anchor[anchor] = (
-                self._estimate_subinterval_feasibility(
-                    interval_left_pos,
-                    midpoint,
-                    remaining,
-                    c_arc,
-                    bottleneck_results,
-                    target_arc,
-                    track_pool,
-                )
-                + self._estimate_subinterval_feasibility(
-                    midpoint,
-                    interval_right_pos,
-                    remaining,
-                    c_arc,
-                    bottleneck_results,
-                    target_arc,
-                    track_pool,
-                )
-            )
         best: tuple[float, int, int, int, dict[str, float]] | None = None
         best_scores_by_candidate: dict[int, float] = {}
+        best_components_by_candidate: dict[int, dict[str, float]] = {}
         for forward in forward_beams:
             for backward in backward_beams:
                 if not forward.used.isdisjoint(backward.used):
@@ -885,51 +432,21 @@ class BIBS:
                         continue
                     left_neighbor = forward.last_track
                     right_neighbor = backward.last_track
-                    energy = self._energy_penalty(
-                        left_neighbor,
-                        anchor,
-                        target_arc[midpoint],
-                        track_pool,
-                    )
-                    harmonic = self._harmonic_diversity_penalty(
-                        anchor,
-                        forward.path,
-                        track_pool,
-                    )
-                    motion = self._harmonic_motion_penalty(
-                        left_neighbor,
-                        anchor,
-                    ) + self._harmonic_motion_penalty(
-                        anchor,
-                        right_neighbor,
-                    )
-                    late_energy = self._late_energy_penalty(
-                        anchor,
-                        left_neighbor,
-                        midpoint,
-                        target_arc,
-                        track_pool,
-                        c_arc,
-                    )
-                    normalized_arc = self._normalize_arc_cost(
-                        c_arc[anchor, midpoint]
-                    )
+                    left_transition_cost = float(c_trans[left_neighbor, anchor])
+                    right_transition_cost = float(c_trans[anchor, right_neighbor])
                     arc_component = (
                         forward.arc_component
                         + backward.arc_component
-                        + self.config.anchor_arc_weight * normalized_arc
+                        + self.config.anchor_arc_weight
+                        * float(c_arc[anchor, midpoint])
                     )
                     left_transition_component = (
                         self.config.anchor_transition_weight
-                        * self._normalize_transition_cost(
-                            c_trans[left_neighbor, anchor]
-                        )
+                        * left_transition_cost
                     )
                     right_transition_component = (
                         self.config.anchor_transition_weight
-                        * self._normalize_transition_cost(
-                            c_trans[anchor, right_neighbor]
-                        )
+                        * right_transition_cost
                     )
                     transition_component = (
                         forward.transition_component
@@ -942,73 +459,31 @@ class BIBS:
                         + backward.bottleneck_component
                         + self._bottleneck_bonus(
                             song_scores[anchor],
-                            c_arc[anchor, midpoint],
                             self.config.anchor_bottleneck_weight,
                         )
                     )
-                    location_bottleneck_component = (
-                        forward.location_bottleneck_component
-                        + backward.location_bottleneck_component
-                        + self.config.anchor_location_bottleneck_weight
-                        * self._normalize_bottleneck_score(
-                            location_scores[midpoint]
-                        )
-                        * normalized_arc
-                    )
-                    energy_momentum_component = (
-                        forward.energy_momentum_component
-                        + backward.energy_momentum_component
-                        + self.config.anchor_energy_momentum_weight
-                        * self._normalize_energy_momentum(energy)
-                        + late_energy
-                    )
-                    harmonic_diversity_component = (
-                        forward.harmonic_diversity_component
-                        + backward.harmonic_diversity_component
-                        + self.config.harmonic_diversity_weight * harmonic
-                    )
-                    harmonic_motion_component = (
-                        forward.harmonic_motion_component
-                        + backward.harmonic_motion_component
-                        + motion
-                    )
-                    feasibility_component = (
-                        forward.feasibility_component
-                        + backward.feasibility_component
-                        + self.config.feasibility_penalty_weight
-                        * feasibility_by_anchor[anchor]
+                    balance_gap = abs(left_transition_cost - right_transition_cost)
+                    balance_component = (
+                        forward.balance_component
+                        + backward.balance_component
+                        + self.config.anchor_balance_weight * balance_gap
                     )
                     score = (
                         arc_component
                         + transition_component
                         + bottleneck_component
-                        + location_bottleneck_component
-                        + energy_momentum_component
-                        + harmonic_diversity_component
-                        + harmonic_motion_component
-                        + feasibility_component
+                        + balance_component
                     )
                     components = {
                         "arc_component": float(arc_component),
                         "transition_component": float(transition_component),
                         "bottleneck_component": float(bottleneck_component),
-                        "location_bottleneck_component": float(
-                            location_bottleneck_component
-                        ),
-                        "energy_momentum_component": float(
-                            energy_momentum_component
-                        ),
-                        "harmonic_diversity_component": float(
-                            harmonic_diversity_component
-                        ),
-                        "harmonic_motion_component": float(
-                            harmonic_motion_component
-                        ),
-                        "feasibility_component": float(feasibility_component),
-                        "feasibility_penalty": float(
-                            feasibility_by_anchor[anchor]
-                        ),
-                        "late_energy_penalty": float(late_energy),
+                        "balance_component": float(balance_component),
+                        "balance_gap": float(balance_gap),
+                        "left_transition_cost": left_transition_cost,
+                        "right_transition_cost": right_transition_cost,
+                        "raw_arc_cost": float(c_arc[anchor, midpoint]),
+                        "raw_bottleneck_score": float(song_scores[anchor]),
                         "left_transition_component": float(
                             left_transition_component
                         ),
@@ -1017,10 +492,12 @@ class BIBS:
                         ),
                     }
                     candidate_score = float(score)
-                    best_scores_by_candidate[anchor] = min(
-                        candidate_score,
-                        best_scores_by_candidate.get(anchor, float("inf")),
-                    )
+                    if candidate_score < best_scores_by_candidate.get(
+                        anchor,
+                        float("inf"),
+                    ):
+                        best_scores_by_candidate[anchor] = candidate_score
+                        best_components_by_candidate[anchor] = components
                     key = (
                         candidate_score,
                         anchor,
@@ -1033,19 +510,25 @@ class BIBS:
             anchor = anchor_candidates[0]
             arc_component = float(
                 self.config.anchor_arc_weight
-                * self._normalize_arc_cost(c_arc[anchor, midpoint])
+                * float(c_arc[anchor, midpoint])
             )
+            left_transition_cost = float(c_trans[left_track, anchor])
+            right_transition_cost = float(c_trans[anchor, right_track])
             left_transition_component = float(
                 self.config.anchor_transition_weight
-                * self._normalize_transition_cost(c_trans[left_track, anchor])
+                * left_transition_cost
             )
             right_transition_component = float(
                 self.config.anchor_transition_weight
-                * self._normalize_transition_cost(c_trans[anchor, right_track])
+                * right_transition_cost
             )
-            harmonic_motion_component = float(
-                self._harmonic_motion_penalty(left_track, anchor)
-                + self._harmonic_motion_penalty(anchor, right_track)
+            bottleneck_component = self._bottleneck_bonus(
+                song_scores[anchor],
+                self.config.anchor_bottleneck_weight,
+            )
+            balance_gap = abs(left_transition_cost - right_transition_cost)
+            balance_component = float(
+                self.config.anchor_balance_weight * balance_gap
             )
             components = {
                 component: 0.0 for component in self.SCORE_COMPONENT_NAMES
@@ -1056,25 +539,26 @@ class BIBS:
                     "transition_component": (
                         left_transition_component + right_transition_component
                     ),
-                    "harmonic_motion_component": harmonic_motion_component,
+                    "bottleneck_component": bottleneck_component,
+                    "balance_component": balance_component,
+                    "balance_gap": float(balance_gap),
+                    "left_transition_cost": left_transition_cost,
+                    "right_transition_cost": right_transition_cost,
+                    "raw_arc_cost": float(c_arc[anchor, midpoint]),
+                    "raw_bottleneck_score": float(song_scores[anchor]),
                     "left_transition_component": left_transition_component,
                     "right_transition_component": right_transition_component,
-                    "feasibility_component": float(
-                        self.config.feasibility_penalty_weight
-                        * feasibility_by_anchor[anchor]
-                    ),
-                    "feasibility_penalty": float(feasibility_by_anchor[anchor]),
-                    "late_energy_penalty": 0.0,
                 }
             )
             score = float(
                 arc_component
                 + left_transition_component
                 + right_transition_component
-                + harmonic_motion_component
-                + components["feasibility_component"]
+                + bottleneck_component
+                + balance_component
             )
             best_scores_by_candidate[anchor] = score
+            best_components_by_candidate[anchor] = components
             left_neighbor = left_track
             right_neighbor = right_track
         else:
@@ -1088,10 +572,30 @@ class BIBS:
             ),
         )
         sources = sorted(candidate_sources.get(anchor, set()))
-        selected_feasibility = float(feasibility_by_anchor[anchor])
-        if selected_feasibility > 0:
-            self._diagnostics["feasibility_penalties_applied"] += 1
-            self._diagnostics["feasibility_penalty_total"] += selected_feasibility
+        top_anchor_candidates = []
+        for candidate in ranked_candidates[:5]:
+            candidate_components = best_components_by_candidate[candidate]
+            top_anchor_candidates.append(
+                {
+                    "track": int(candidate),
+                    "score": float(best_scores_by_candidate[candidate]),
+                    "arc_component": float(
+                        candidate_components["arc_component"]
+                    ),
+                    "transition_component": float(
+                        candidate_components["transition_component"]
+                    ),
+                    "bottleneck_component": float(
+                        candidate_components["bottleneck_component"]
+                    ),
+                    "balance_component": float(
+                        candidate_components["balance_component"]
+                    ),
+                    "raw_bottleneck_score": float(
+                        candidate_components["raw_bottleneck_score"]
+                    ),
+                }
+            )
         selection_details = {
             **components,
             "candidate_count": len(anchor_candidates),
@@ -1123,7 +627,70 @@ class BIBS:
             ),
             "whether_selected_candidate_from_bottleneck": "bottleneck" in sources,
             "whether_selected_candidate_from_bridge": "bridge" in sources,
+            "best_candidate_track": (
+                int(ranked_candidates[0]) if ranked_candidates else None
+            ),
+            "top_anchor_candidates": top_anchor_candidates,
         }
+        self.anchor_selection_trace.append(
+            {
+                "interval_left_pos": interval_left_pos,
+                "interval_right_pos": interval_right_pos,
+                "midpoint": midpoint,
+                "selected_anchor_track": anchor,
+                "selected_left_neighbor": left_neighbor,
+                "selected_right_neighbor": right_neighbor,
+                "selected_anchor_score": float(score),
+                "selected_anchor_rank": selection_details[
+                    "selected_candidate_rank"
+                ],
+                "candidate_count": len(anchor_candidates),
+                "arc_component": float(selection_details["arc_component"]),
+                "transition_component": float(
+                    selection_details["transition_component"]
+                ),
+                "bottleneck_component": float(
+                    selection_details["bottleneck_component"]
+                ),
+                "balance_component": float(
+                    selection_details["balance_component"]
+                ),
+                "left_transition_cost": float(
+                    selection_details["left_transition_cost"]
+                ),
+                "right_transition_cost": float(
+                    selection_details["right_transition_cost"]
+                ),
+                "balance_gap": float(selection_details["balance_gap"]),
+                "raw_arc_cost": float(selection_details["raw_arc_cost"]),
+                "raw_bottleneck_score": float(
+                    selection_details["raw_bottleneck_score"]
+                ),
+                "selected_candidate_sources": selection_details[
+                    "selected_candidate_sources"
+                ],
+                "whether_selected_candidate_from_graph": selection_details[
+                    "whether_selected_candidate_from_graph"
+                ],
+                "whether_selected_candidate_from_candidate_set": selection_details[
+                    "whether_selected_candidate_from_candidate_set"
+                ],
+                "whether_selected_candidate_from_bottleneck": selection_details[
+                    "whether_selected_candidate_from_bottleneck"
+                ],
+                "whether_selected_candidate_from_bridge": selection_details[
+                    "whether_selected_candidate_from_bridge"
+                ],
+                "best_candidate_track": selection_details["best_candidate_track"],
+                "best_candidate_score": selection_details[
+                    "best_candidate_score"
+                ],
+                "score_gap_from_best": selection_details[
+                    "score_gap_from_best"
+                ],
+                "top_anchor_candidates": top_anchor_candidates,
+            }
+        )
         return anchor, left_neighbor, right_neighbor, float(score), selection_details
 
     def _record_anchor(
@@ -1144,9 +711,6 @@ class BIBS:
         track_pool: pd.DataFrame,
     ) -> None:
         song_scores = np.asarray(bottleneck_results["song_bottleneck_scores"])
-        location_scores = np.asarray(
-            bottleneck_results["location_bottleneck_scores"]
-        )
         alignment = float(
             c_arc[anchor, position]
             + c_trans[left_neighbor, anchor]
@@ -1161,7 +725,6 @@ class BIBS:
             "left_transition_cost": float(c_trans[left_neighbor, anchor]),
             "right_transition_cost": float(c_trans[anchor, right_neighbor]),
             "bs_song": float(song_scores[anchor]),
-            "bs_loc": float(location_scores[position]),
             "anchor_alignment_cost": alignment,
             "anchor_score": float(score),
         }
@@ -1204,7 +767,8 @@ class BIBS:
         bottleneck_results: dict,
         target_arc: np.ndarray,
         track_pool: pd.DataFrame,
-    ) -> float:
+    ) -> tuple[float, dict[str, float]]:
+        del target_arc, track_pool
         song_scores = np.asarray(bottleneck_results["song_bottleneck_scores"])
         arc_cost = sum(
             self._normalize_arc_cost(c_arc[track, position])
@@ -1219,87 +783,26 @@ class BIBS:
             self._normalize_transition_cost(cost)
             for cost in raw_transition_costs
         )
-        bad_transition_penalty = self.config.bad_transition_penalty_weight * sum(
-            max(0.0, cost - self.config.bad_transition_threshold)
-            for cost in raw_transition_costs
-        )
-        energy_cost = 0.0
-        late_energy_cost = 0.0
-        harmonic_cost = 0.0
-        harmonic_motion_cost = sum(
-            self._harmonic_motion_penalty(source, target)
-            for source, target in zip(path, path[1:])
-        )
-        recent: list[int] = [left_track]
-        for offset, track in enumerate(sequence):
-            previous = recent[-1]
-            energy_cost += self._energy_penalty(
-                previous,
-                track,
-                target_arc[positions[offset]],
-                track_pool,
-            )
-            late_energy_cost += self._late_energy_penalty(
-                track,
-                previous,
-                positions[offset],
-                target_arc,
-                track_pool,
-                c_arc,
-            )
-            harmonic_cost += self._harmonic_diversity_penalty(
-                track,
-                recent,
-                track_pool,
-            )
-            recent.append(track)
-        energy_cost += self._energy_penalty(
-            recent[-1],
-            right_track,
-            target_arc[min(positions[-1] + 1, len(target_arc) - 1)],
-            track_pool,
-        )
         components = {
             "arc_component": float(self.config.base_arc_weight * arc_cost),
             "transition_component": float(
                 self.config.base_transition_weight * transition_cost
-                + bad_transition_penalty
             ),
             "bottleneck_component": float(
                 sum(
                     self._bottleneck_bonus(
                         song_scores[track],
-                        c_arc[track, position],
                         self.config.bottleneck_weight,
                     )
                     for track, position in zip(sequence, positions)
                 )
             ),
-            "location_bottleneck_component": 0.0,
-            "energy_momentum_component": float(
-                self.config.base_energy_momentum_weight
-                * self._normalize_energy_momentum(energy_cost)
-                + (
-                    self.config.base_high_energy_penalty_weight
-                    / 3.0
-                )
-                * late_energy_cost
-            ),
-            "harmonic_diversity_component": float(
-                self.config.harmonic_diversity_weight * harmonic_cost
-            ),
-            "harmonic_motion_component": float(harmonic_motion_cost),
-            "feasibility_component": 0.0,
-            "bad_transition_penalty": float(bad_transition_penalty),
-            "late_energy_penalty": float(late_energy_cost),
+            "balance_component": 0.0,
         }
         score = (
             components["arc_component"]
             + components["transition_component"]
             + components["bottleneck_component"]
-            + components["energy_momentum_component"]
-            + components["harmonic_diversity_component"]
-            + components["harmonic_motion_component"]
         )
         return float(score), components
 
@@ -1340,7 +843,6 @@ class BIBS:
         candidate_sources: list[int] = list(candidates)
         candidate_sources.extend(graph_data.outgoing_neighbors[left_track])
         candidate_sources.extend(graph_data.incoming_neighbors[right_track])
-        per_position_limit = self.config.base_case_extra_candidates_per_position
         for position in positions:
             arc_order = np.argsort(c_arc[:, position], kind="stable")
             candidate_sources.extend(
@@ -1348,14 +850,6 @@ class BIBS:
                 for track in arc_order
                 if int(track) in available_tracks
             )
-            ev_order = sorted(
-                available_tracks,
-                key=lambda track: (
-                    abs(float(self._ev_scores[track]) - target_arc[position]),
-                    track,
-                ),
-            )
-            candidate_sources.extend(ev_order[:per_position_limit])
             candidate_sources.extend(
                 int(track)
                 for track in bottleneck_results["candidate_sets"][position]
@@ -1386,21 +880,15 @@ class BIBS:
                 self._normalize_arc_cost(c_arc[track, position])
                 for position in positions
             )
-            ev_fit = min(
-                abs(float(self._ev_scores[track]) - target_arc[position])
-                for position in positions
-            )
             boundary_fit = min(
                 self._normalize_transition_cost(c_trans[left_track, track]),
                 self._normalize_transition_cost(c_trans[track, right_track]),
             )
-            return float(arc_fit + ev_fit + 0.25 * boundary_fit), track
+            return float(arc_fit + 0.25 * boundary_fit), track
 
         desired_count = min(
             len(available_tracks),
             self.config.base_case_max_candidates,
-            len(positions)
-            + self.config.base_case_extra_candidates_per_position * len(positions),
         )
         candidates = sorted(merged_candidates, key=candidate_quality)[:desired_count]
         if len(candidates) < len(positions):
@@ -1436,6 +924,52 @@ class BIBS:
         for position, track in zip(positions, best_sequence):
             playlist[position] = track
             available_tracks.remove(track)
+        selected_path = (left_track,) + best_sequence + (right_track,)
+        selected_transition_costs = [
+            float(c_trans[source, target])
+            for source, target in zip(selected_path, selected_path[1:])
+        ]
+        average_arc_cost_selected = float(
+            np.mean(
+                [
+                    float(c_arc[track, position])
+                    for track, position in zip(best_sequence, positions)
+                ]
+            )
+        )
+        self.base_case_trace.append(
+            {
+                "left_pos": left_pos,
+                "right_pos": right_pos,
+                "interval_size": right_pos - left_pos + 1,
+                "empty_count": len(positions),
+                "empty_positions": list(positions),
+                "left_boundary_track": left_track,
+                "right_boundary_track": right_track,
+                "candidate_count": len(candidates),
+                "initial_candidate_count": initial_candidate_count,
+                "forced_assignment_warning": forced_assignment,
+                "permutation_count_tried": permutation_count,
+                "selected_tracks": list(best_sequence),
+                "local_score_total": float(best_score),
+                "arc_component": float(best_components["arc_component"]),
+                "transition_component": float(
+                    best_components["transition_component"]
+                ),
+                "bottleneck_component": float(
+                    best_components["bottleneck_component"]
+                ),
+                "balance_component": float(
+                    best_components.get("balance_component", 0.0)
+                ),
+                "average_arc_cost_selected": average_arc_cost_selected,
+                "total_transition_cost_selected": float(
+                    sum(selected_transition_costs)
+                ),
+                "first_transition_cost": float(selected_transition_costs[0]),
+                "last_transition_cost": float(selected_transition_costs[-1]),
+            }
+        )
         self._diagnostics["base_cases_solved"] += 1
         self._diagnostics["base_case_candidate_count_total"] += len(candidates)
         self._diagnostics["worst_base_case_transition_component"] = max(
@@ -1451,10 +985,6 @@ class BIBS:
                 "selected_tracks": list(best_sequence),
                 "local_score_total": float(best_score),
                 **best_components,
-                "harmonic_component": float(
-                    best_components["harmonic_diversity_component"]
-                    + best_components["harmonic_motion_component"]
-                ),
                 "candidate_count": len(candidates),
                 "initial_candidate_count": initial_candidate_count,
                 "forced_assignment_warning": forced_assignment,
@@ -1483,6 +1013,27 @@ class BIBS:
             return
         self._diagnostics["intervals_solved"] += 1
         if empty_count <= self.config.base_case_size or depth >= self.config.max_recursion_depth:
+            self.recursion_trace.append(
+                {
+                    "depth": depth,
+                    "left_pos": left_pos,
+                    "right_pos": right_pos,
+                    "interval_size": right_pos - left_pos + 1,
+                    "empty_count": empty_count,
+                    "midpoint": None,
+                    "is_base_case": True,
+                    "forward_positions_start": None,
+                    "forward_positions_end": None,
+                    "forward_positions_count": 0,
+                    "backward_positions_start": None,
+                    "backward_positions_end": None,
+                    "backward_positions_count": 0,
+                    "selected_anchor_position": None,
+                    "selected_anchor_track": None,
+                    "left_child_interval": None,
+                    "right_child_interval": None,
+                }
+            )
             self._fill_base_case(
                 playlist,
                 left_pos,
@@ -1501,13 +1052,8 @@ class BIBS:
         midpoint = (left_pos + right_pos) // 2
         left_track = int(playlist[left_pos])
         right_track = int(playlist[right_pos])
-        horizon = self.config.base_case_size
-        forward_positions = list(
-            range(left_pos + 1, min(midpoint, left_pos + 1 + horizon))
-        )
-        backward_positions = list(
-            range(right_pos - 1, max(midpoint, right_pos - 1 - horizon), -1)
-        )
+        forward_positions = list(range(left_pos + 1, midpoint))
+        backward_positions = list(range(right_pos - 1, midpoint, -1))
         forward_beams = self._expand_beam(
             left_track,
             forward_positions,
@@ -1580,6 +1126,35 @@ class BIBS:
             c_trans,
             bottleneck_results,
             track_pool,
+        )
+        self.recursion_trace.append(
+            {
+                "depth": depth,
+                "left_pos": left_pos,
+                "right_pos": right_pos,
+                "interval_size": right_pos - left_pos + 1,
+                "empty_count": empty_count,
+                "midpoint": midpoint,
+                "is_base_case": False,
+                "forward_positions_start": (
+                    forward_positions[0] if forward_positions else None
+                ),
+                "forward_positions_end": (
+                    forward_positions[-1] if forward_positions else None
+                ),
+                "forward_positions_count": len(forward_positions),
+                "backward_positions_start": (
+                    backward_positions[0] if backward_positions else None
+                ),
+                "backward_positions_end": (
+                    backward_positions[-1] if backward_positions else None
+                ),
+                "backward_positions_count": len(backward_positions),
+                "selected_anchor_position": midpoint,
+                "selected_anchor_track": anchor,
+                "left_child_interval": [left_pos, midpoint],
+                "right_child_interval": [midpoint, right_pos],
+            }
         )
         self._solve_interval(
             playlist,
@@ -1694,7 +1269,6 @@ class BIBS:
         if available_tracks or any(track is None for track in playlist):
             raise ValueError("BIBS failed to place every track exactly once.")
         result = [int(track) for track in playlist]
-        result = self._final_repair(result, c_arc, c_trans)
         if (
             len(result) != number_of_tracks
             or len(set(result)) != number_of_tracks
@@ -1709,26 +1283,165 @@ class BIBS:
         diagnostics = dict(self._diagnostics)
         anchors_selected = int(diagnostics["anchors_selected"])
         decision_count = len(self.decision_trace)
+        recursion_base_case_count = sum(
+            1 for record in self.recursion_trace if record["is_base_case"]
+        )
+        recursion_non_base_case_count = (
+            len(self.recursion_trace) - recursion_base_case_count
+        )
+        diagnostics["recursion_trace"] = [dict(record) for record in self.recursion_trace]
+        diagnostics["recursion_trace_count"] = len(self.recursion_trace)
+        diagnostics["recursion_base_case_count"] = recursion_base_case_count
+        diagnostics["recursion_non_base_case_count"] = recursion_non_base_case_count
+        diagnostics["max_observed_recursion_depth"] = (
+            max((record["depth"] for record in self.recursion_trace), default=0)
+        )
+        diagnostics["beam_trace"] = [dict(record) for record in self.beam_trace]
+        diagnostics["beam_trace_count"] = len(self.beam_trace)
+        diagnostics["forward_beam_trace_count"] = sum(
+            1 for record in self.beam_trace if record["direction"] == "forward"
+        )
+        diagnostics["backward_beam_trace_count"] = sum(
+            1 for record in self.beam_trace if record["direction"] == "backward"
+        )
+        diagnostics["max_beams_after_pruning"] = max(
+            (record["beams_after_pruning"] for record in self.beam_trace),
+            default=0,
+        )
+        diagnostics["max_expanded_candidate_count"] = max(
+            (record["expanded_candidate_count"] for record in self.beam_trace),
+            default=0,
+        )
+        diagnostics["max_positions_in_beam_call"] = max(
+            (record["total_positions_in_call"] for record in self.beam_trace),
+            default=0,
+        )
+        anchor_trace_count = len(self.anchor_selection_trace)
+        diagnostics["anchor_selection_trace"] = [
+            dict(record) for record in self.anchor_selection_trace
+        ]
+        diagnostics["anchor_selection_trace_count"] = anchor_trace_count
+
+        def average_anchor_trace_value(name: str) -> float:
+            return (
+                float(
+                    sum(
+                        float(record[name])
+                        for record in self.anchor_selection_trace
+                    )
+                )
+                / anchor_trace_count
+                if anchor_trace_count
+                else 0.0
+            )
+
+        diagnostics["average_selected_anchor_score"] = (
+            average_anchor_trace_value("selected_anchor_score")
+        )
+        diagnostics["average_anchor_arc_component"] = average_anchor_trace_value(
+            "arc_component"
+        )
+        diagnostics["average_anchor_transition_component"] = (
+            average_anchor_trace_value("transition_component")
+        )
+        diagnostics["average_anchor_bottleneck_component"] = (
+            average_anchor_trace_value("bottleneck_component")
+        )
+        diagnostics["average_anchor_balance_component"] = (
+            average_anchor_trace_value("balance_component")
+        )
+        diagnostics["max_anchor_score_gap_from_best"] = max(
+            (
+                float(record["score_gap_from_best"])
+                for record in self.anchor_selection_trace
+            ),
+            default=0.0,
+        )
+        diagnostics["average_anchor_candidate_count"] = average_anchor_trace_value(
+            "candidate_count"
+        )
+        diagnostics["selected_anchor_from_graph_count"] = sum(
+            1
+            for record in self.anchor_selection_trace
+            if record["whether_selected_candidate_from_graph"]
+        )
+        diagnostics["selected_anchor_from_candidate_set_count"] = sum(
+            1
+            for record in self.anchor_selection_trace
+            if record["whether_selected_candidate_from_candidate_set"]
+        )
+        diagnostics["selected_anchor_from_bottleneck_count"] = sum(
+            1
+            for record in self.anchor_selection_trace
+            if record["whether_selected_candidate_from_bottleneck"]
+        )
+        diagnostics["selected_anchor_from_bridge_count"] = sum(
+            1
+            for record in self.anchor_selection_trace
+            if record["whether_selected_candidate_from_bridge"]
+        )
         diagnostics["average_anchor_score"] = (
             self._anchor_score_total / anchors_selected if anchors_selected else 0.0
         )
         diagnostics["major_decisions_recorded"] = decision_count
         base_cases = int(diagnostics["base_cases_solved"])
+        base_case_trace_count = len(self.base_case_trace)
+        diagnostics["base_case_trace"] = [
+            dict(record) for record in self.base_case_trace
+        ]
+        diagnostics["base_case_trace_count"] = base_case_trace_count
         diagnostics["average_base_case_candidate_count"] = (
             float(diagnostics["base_case_candidate_count_total"]) / base_cases
             if base_cases
             else 0.0
         )
-        diagnostics["average_feasibility_penalty"] = (
-            float(diagnostics["feasibility_penalty_total"]) / anchors_selected
-            if anchors_selected
+        diagnostics["average_base_case_permutation_count"] = (
+            float(
+                sum(
+                    record["permutation_count_tried"]
+                    for record in self.base_case_trace
+                )
+            )
+            / base_case_trace_count
+            if base_case_trace_count
             else 0.0
         )
-        late_energy_count = int(diagnostics["late_energy_penalty_count"])
-        diagnostics["average_late_energy_penalty"] = (
-            float(diagnostics["late_energy_penalty_total"]) / late_energy_count
-            if late_energy_count
+        diagnostics["average_base_case_local_score"] = (
+            float(
+                sum(record["local_score_total"] for record in self.base_case_trace)
+            )
+            / base_case_trace_count
+            if base_case_trace_count
             else 0.0
+        )
+        diagnostics["average_base_case_transition_component"] = (
+            float(
+                sum(
+                    record["transition_component"]
+                    for record in self.base_case_trace
+                )
+            )
+            / base_case_trace_count
+            if base_case_trace_count
+            else 0.0
+        )
+        diagnostics["max_base_case_transition_component"] = max(
+            (
+                float(record["transition_component"])
+                for record in self.base_case_trace
+            ),
+            default=0.0,
+        )
+        diagnostics["max_base_case_candidate_count"] = max(
+            (record["candidate_count"] for record in self.base_case_trace),
+            default=0,
+        )
+        diagnostics["max_base_case_permutation_count"] = max(
+            (
+                record["permutation_count_tried"]
+                for record in self.base_case_trace
+            ),
+            default=0,
         )
         for component in self.SCORE_COMPONENT_NAMES:
             diagnostics[f"average_{component}_per_decision"] = (
