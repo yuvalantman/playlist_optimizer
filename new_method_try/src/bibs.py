@@ -55,6 +55,14 @@ class BIBSConfig:
     # transition decide placements, while the candidate orchestrator still surfaces
     # bottleneck tracks (exposure), demoting the bottleneck term per the plan.
     bottleneck_mode: str = "score"
+    # Tempo-aware scoring. When tempo_jump_threshold > 0 an extra penalty is added
+    # to any candidate that causes a large BPM jump (|log2 ratio| > threshold).
+    # The penalty is waived (excuse) for tracks whose arc cost is very low
+    # (great trajectory fit), so excellent-position songs can still win even with
+    # an unusual tempo.
+    tempo_jump_threshold: float = 0.0
+    tempo_jump_penalty: float = 3.0
+    tempo_excuse_arc_threshold: float = 0.10
 
 
 @dataclass(frozen=True)
@@ -103,6 +111,7 @@ class BIBS:
         self._diagnostics: dict[str, int | float | bool] = {}
         self._anchor_score_total = 0.0
         self._ev_scores = np.asarray([], dtype=float)
+        self._tempos: np.ndarray | None = None
         self._camelot_codes = np.asarray([], dtype=str)
         self._camelot_numbers = np.asarray([], dtype=str)
         self._rng = np.random.default_rng(config.random_seed)
@@ -359,6 +368,25 @@ class BIBS:
                         + transition_component
                         + bottleneck_component
                     )
+                    if (
+                        self.config.tempo_jump_threshold > 0
+                        and self._tempos is not None
+                    ):
+                        t_prev = float(self._tempos[beam.last_track])
+                        t_cand = float(self._tempos[candidate])
+                        if t_prev > 0 and t_cand > 0:
+                            raw_jump = abs(np.log2(t_cand / t_prev))
+                            if raw_jump > self.config.tempo_jump_threshold:
+                                exc_thresh = self.config.tempo_excuse_arc_threshold
+                                excuse = (
+                                    max(0.0, 1.0 - float(c_arc[candidate, position]) / exc_thresh)
+                                    if exc_thresh > 0 else 0.0
+                                )
+                                local_score += (
+                                    self.config.tempo_jump_penalty
+                                    * (raw_jump - self.config.tempo_jump_threshold)
+                                    * (1.0 - excuse)
+                                )
                     expanded.append(
                         _BeamItem(
                             path=beam.path + (candidate,),
@@ -518,6 +546,27 @@ class BIBS:
                         + bottleneck_component
                         + balance_component
                     )
+                    if (
+                        self.config.tempo_jump_threshold > 0
+                        and self._tempos is not None
+                    ):
+                        t_left = float(self._tempos[left_neighbor])
+                        t_right = float(self._tempos[right_neighbor])
+                        t_anc = float(self._tempos[anchor])
+                        exc_thresh = self.config.tempo_excuse_arc_threshold
+                        excuse = (
+                            max(0.0, 1.0 - float(c_arc[anchor, midpoint]) / exc_thresh)
+                            if exc_thresh > 0 else 0.0
+                        )
+                        for t_nbr in (t_left, t_right):
+                            if t_nbr > 0 and t_anc > 0:
+                                raw_jump = abs(np.log2(t_anc / t_nbr))
+                                if raw_jump > self.config.tempo_jump_threshold:
+                                    score += (
+                                        self.config.tempo_jump_penalty
+                                        * (raw_jump - self.config.tempo_jump_threshold)
+                                        * (1.0 - excuse)
+                                    )
                     components = {
                         "arc_component": float(arc_component),
                         "transition_component": float(transition_component),
@@ -1333,6 +1382,10 @@ class BIBS:
             track_pool["EV_score"],
             errors="raise",
         ).to_numpy(dtype=float)
+        if "tempo" in track_pool.columns and self.config.tempo_jump_threshold > 0:
+            self._tempos = pd.to_numeric(
+                track_pool["tempo"], errors="coerce"
+            ).to_numpy(dtype=float)
         self._camelot_codes = track_pool["camelot"].astype(str).to_numpy()
         if "camelot_number" in track_pool.columns:
             self._camelot_numbers = (

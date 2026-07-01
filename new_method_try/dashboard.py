@@ -17,6 +17,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+try:
+    import plotly.express as px
+    _PLOTLY_AVAILABLE = True
+except ImportError:
+    _PLOTLY_AVAILABLE = False
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.arcs import SHAPES  # noqa: E402
@@ -39,7 +45,7 @@ st.set_page_config(page_title="Playlist Ordering Lab", layout="wide")
 DISPLAY_COLUMNS = [
     "method", "category", "arc_optimized", "arc_rmse", "total_transition_cost",
     "average_transition_cost", "global_coherence", "p90_transition", "p95_transition",
-    "max_transition", "dtw_shape", "ratio_adherence_rmse",
+    "max_transition", "dtw_shape", "ratio_adherence_rmse", "wall_time_s",
 ]
 
 
@@ -88,9 +94,10 @@ def run_experiment(config: dict) -> dict:
         arc_shape = str(rng.choice(shape_pool))
         # --- build + run ---
         pool = sample_pool(catalog, genres, config["length"], seed)
-        inp = prepare_pipeline(pool, seed, arc_shape, genres)
-        playlists = run_all_methods(inp, seed)
-        metrics = evaluate_methods(playlists, inp)
+        endpoint_mode = config.get("endpoint_mode", "quantile")
+        inp = prepare_pipeline(pool, seed, arc_shape, genres, endpoint_mode=endpoint_mode)
+        playlists, timings = run_all_methods(inp, seed, include_new_variants=config.get("new_variants", True))
+        metrics = evaluate_methods(playlists, inp, timings=timings)
         results.append(
             {
                 "index": i,
@@ -156,6 +163,22 @@ else:
     )
 base_seed = st.sidebar.number_input("Base random seed", value=42, step=1)
 
+st.sidebar.divider()
+st.sidebar.subheader("Advanced options")
+endpoint_mode = st.sidebar.radio(
+    "Endpoint selection",
+    ["quantile (standard)", "trajectory-first (new)"],
+    help="Standard: pick EV-extreme tracks then snap trajectory. "
+         "Trajectory-first: define trajectory from pool range first, then pick best-fit endpoints.",
+)
+endpoint_mode_key = "quantile" if "quantile" in endpoint_mode else "trajectory_fit"
+include_new_variants = st.sidebar.checkbox(
+    "Include new method variants",
+    value=True,
+    help="Run stochastic MM beam, tempo-aware BIBS, alpha-boost, and trajectory-first variants. "
+         "Adds ~3-5 methods but increases runtime.",
+)
+
 run_clicked = st.sidebar.button("Run experiments", type="primary")
 st.sidebar.caption(
     f"Estimated work: {num_playlists} playlists x {len(METHOD_INFO)} methods. "
@@ -176,6 +199,8 @@ if run_clicked:
             "length": int(length),
             "arc_shapes": arc_shapes,
             "base_seed": int(base_seed),
+            "endpoint_mode": endpoint_mode_key,
+            "new_variants": include_new_variants,
         }
         try:
             with st.spinner("Generating playlists and running all methods..."):
@@ -188,9 +213,9 @@ if run_clicked:
 # --------------------------------------------------------------------------- #
 # Tabs
 # --------------------------------------------------------------------------- #
-tab_results, tab_examples, tab_var, tab_formulas, tab_metrics, tab_genres = st.tabs(
+tab_results, tab_examples, tab_var, tab_eval, tab_formulas, tab_metrics, tab_genres = st.tabs(
     ["Run & Results", "Playlist Examples", "BIBS Variability",
-     "Formulas", "Metric Definitions", "Genre Explorer"]
+     "Evaluation Suite Results", "Formulas", "Metric Definitions", "Genre Explorer"]
 )
 
 experiment = st.session_state.get("experiment")
@@ -327,6 +352,185 @@ with tab_metrics:
     for metric, body in METRIC_EXPLANATIONS.items():
         with st.expander(metric, expanded=False):
             st.markdown(body)
+
+
+with tab_eval:
+    st.header("Evaluation Suite Results")
+
+    EVAL_DIR = Path(__file__).resolve().parent / "outputs" / "results" / "evaluation_suite"
+    RAW_PATH = EVAL_DIR / "raw_results.csv"
+
+    METRIC_LABELS = {
+        "arc_rmse": "Arc RMSE (↓)",
+        "total_transition_cost": "Total Transition (↓)",
+        "average_transition_cost": "Avg Transition (↓)",
+        "global_coherence": "Coherence (↑)",
+        "p90_transition": "P90 Transition (↓)",
+        "p95_transition": "P95 Transition (↓)",
+        "max_transition": "Max Transition (↓)",
+        "dtw_shape": "DTW Shape (↓)",
+        "ratio_adherence_rmse": "Ratio Adherence RMSE (↓)",
+        "method_time_s": "Method Time (s, ↓)",
+        "total_time_s": "Total Time (s, ↓)",
+    }
+    ALL_METRICS = list(METRIC_LABELS.keys())
+
+    if not RAW_PATH.exists():
+        st.info(
+            "No evaluation results found. Run the evaluation suite first:\n\n"
+            "```powershell\n"
+            "cd new_method_try\n"
+            "python -m src.experiments.evaluation_suite --playlists 40\n"
+            "```\n\n"
+            "Quick test (3 playlists/cell, N=60 only):\n\n"
+            "```powershell\n"
+            "python -m src.experiments.evaluation_suite --quick\n"
+            "```"
+        )
+    else:
+        @st.cache_data(show_spinner=False)
+        def load_raw(path_str: str) -> pd.DataFrame:
+            df = pd.read_csv(path_str)
+            # drop rows with errors
+            return df[df.get("error", pd.Series(dtype=str)).isna()].copy() if "error" in df.columns else df
+
+        raw = load_raw(str(RAW_PATH))
+        st.caption(
+            f"Loaded **{len(raw):,}** method×playlist rows from `{RAW_PATH.name}`. "
+            f"Playlists: {raw[['experiment_type','n_size','seed']].drop_duplicates().shape[0]}. "
+            f"Methods: {raw['method'].nunique()}."
+        )
+
+        # ---- Sidebar-style filters inside the tab ----
+        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+        with col_f1:
+            exp_filter = st.multiselect(
+                "Experiment type", sorted(raw["experiment_type"].unique()),
+                default=sorted(raw["experiment_type"].unique()), key="eval_exp"
+            )
+        with col_f2:
+            n_filter = st.multiselect(
+                "N size", sorted(raw["n_size"].unique()),
+                default=sorted(raw["n_size"].unique()), key="eval_n"
+            )
+        with col_f3:
+            shape_filter = st.multiselect(
+                "Trajectory shape", sorted(raw["trajectory_shape"].unique()),
+                default=sorted(raw["trajectory_shape"].unique()), key="eval_shape"
+            )
+        with col_f4:
+            method_filter = st.multiselect(
+                "Methods", sorted(raw["method"].unique()),
+                default=sorted(raw["method"].unique()), key="eval_method"
+            )
+
+        filtered = raw[
+            raw["experiment_type"].isin(exp_filter) &
+            raw["n_size"].isin(n_filter) &
+            raw["trajectory_shape"].isin(shape_filter) &
+            raw["method"].isin(method_filter)
+        ]
+        st.caption(f"Filtered: {len(filtered):,} rows")
+
+        # ---- Summary tables ----
+        st.subheader("Overall averages")
+        available_metrics = [c for c in ALL_METRICS if c in filtered.columns]
+        overall = (
+            filtered.groupby(["method", "category"], sort=False)[available_metrics]
+            .mean().round(4).reset_index()
+            .sort_values("arc_rmse") if "arc_rmse" in available_metrics
+            else filtered.groupby(["method", "category"], sort=False)[available_metrics]
+            .mean().round(4).reset_index()
+        )
+        st.dataframe(overall, use_container_width=True)
+
+        # ---- Ranking ----
+        ranking_path = EVAL_DIR / "ranking.csv"
+        if ranking_path.exists():
+            with st.expander("Method ranking (composite score across all metrics)"):
+                st.dataframe(pd.read_csv(ranking_path), use_container_width=True)
+
+        # ---- Slice tables ----
+        with st.expander("By N size"):
+            st.dataframe(
+                filtered.groupby(["method", "n_size"], sort=False)[available_metrics]
+                .mean().round(4).reset_index(), use_container_width=True
+            )
+        with st.expander("By trajectory shape"):
+            st.dataframe(
+                filtered.groupby(["method", "trajectory_shape"], sort=False)[available_metrics]
+                .mean().round(4).reset_index(), use_container_width=True
+            )
+        with st.expander("By experiment type"):
+            st.dataframe(
+                filtered.groupby(["method", "experiment_type"], sort=False)[available_metrics]
+                .mean().round(4).reset_index(), use_container_width=True
+            )
+        similar_df = filtered[filtered["experiment_type"] == "similar_genres"]
+        if not similar_df.empty:
+            with st.expander("By genre set (similar-genres experiments only)"):
+                st.dataframe(
+                    similar_df.groupby(["method", "genre_set"], sort=False)[available_metrics]
+                    .mean().round(4).reset_index(), use_container_width=True
+                )
+
+        # ---- Interactive Plotly chart ----
+        st.subheader("Interactive comparison chart")
+        if not _PLOTLY_AVAILABLE:
+            st.warning("Install plotly (`pip install plotly`) to see the interactive chart.")
+        else:
+            chart_col1, chart_col2 = st.columns([1, 3])
+            with chart_col1:
+                y_metrics = st.multiselect(
+                    "Y-axis metrics", available_metrics,
+                    default=["arc_rmse", "p95_transition", "global_coherence"],
+                    key="chart_y"
+                )
+                group_by = st.selectbox(
+                    "Group / color by",
+                    ["none", "n_size", "trajectory_shape", "experiment_type"],
+                    key="chart_group"
+                )
+                chart_type = st.radio("Chart type", ["Bar", "Box"], key="chart_type")
+                show_category = st.checkbox("Color by category (baseline/ours)", value=True, key="chart_cat")
+
+            with chart_col2:
+                if not y_metrics:
+                    st.info("Select at least one metric.")
+                else:
+                    for metric in y_metrics:
+                        plot_df = filtered.copy()
+                        if group_by != "none":
+                            plot_df["method_group"] = (
+                                plot_df["method"].astype(str) + " [" + plot_df[group_by].astype(str) + "]"
+                            )
+                            x_col = "method_group"
+                        else:
+                            x_col = "method"
+
+                        color_col = "category" if show_category else None
+                        label = METRIC_LABELS.get(metric, metric)
+
+                        if chart_type == "Bar":
+                            agg = plot_df.groupby([x_col] + (["category"] if show_category else []))[metric].mean().reset_index()
+                            fig = px.bar(
+                                agg, x=x_col, y=metric,
+                                color=color_col if show_category else None,
+                                title=label,
+                                labels={metric: label, x_col: ""},
+                                height=420,
+                                barmode="group",
+                            )
+                        else:
+                            fig = px.box(
+                                plot_df, x=x_col, y=metric,
+                                color=color_col if show_category else None,
+                                title=label,
+                                labels={metric: label, x_col: ""},
+                                height=420,
+                            )
+                        fig.update_layout(xaxis_tickangle=-45, legend_title="")
+                        st.plotly_chart(fig, use_container_width=True)
 
 
 with tab_genres:

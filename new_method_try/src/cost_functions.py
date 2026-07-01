@@ -1,7 +1,32 @@
 """Cost functions for transitions between playlist tracks."""
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
+
+
+@dataclass(frozen=True)
+class TransitionCostConfig:
+    """Weights and thresholds for the transition cost matrix.
+
+    alpha: rhythm (tempo + meter) weight.
+    beta: tonality weight.
+    gamma: texture weight.
+    meter_penalty: added to rhythm cost when time signatures differ.
+    mode_height: z-height of major vs minor on the circle-of-fifths prism.
+    tempo_jump_threshold: log2-ratio above which an extra penalty fires
+        (0 = disabled; 0.30 ≈ 26% BPM change is a good DJ-motivated default).
+    tempo_jump_penalty: extra cost multiplied by the excess above the threshold.
+    """
+
+    alpha: float = 1.0
+    beta: float = 0.4
+    gamma: float = 0.6
+    meter_penalty: float = 0.25
+    mode_height: float = 0.5
+    tempo_jump_threshold: float = 0.0
+    tempo_jump_penalty: float = 3.0
 
 
 def tempo_distance(tempo_u: float, tempo_v: float) -> float:
@@ -177,8 +202,26 @@ def compute_transition_cost_matrix(
     gamma: float = 0.6,
     meter_penalty: float = 0.25,
     mode_height: float = 0.5,
+    tempo_jump_threshold: float = 0.0,
+    tempo_jump_penalty: float = 3.0,
+    config: "TransitionCostConfig | None" = None,
 ) -> np.ndarray:
-    """Return full rhythm, tonality, and texture transition costs."""
+    """Return full rhythm, tonality, and texture transition costs.
+
+    Pass a ``TransitionCostConfig`` via ``config`` to set all parameters at once;
+    individual keyword args are used when ``config`` is None (backward-compatible).
+    When ``tempo_jump_threshold > 0`` (or set via config), a soft ramp penalty is
+    added to the rhythm component for any pair whose log2-BPM ratio exceeds the
+    threshold — discouraging jarring tempo jumps without creating a hard cliff.
+    """
+    if config is not None:
+        alpha = config.alpha
+        beta = config.beta
+        gamma = config.gamma
+        meter_penalty = config.meter_penalty
+        mode_height = config.mode_height
+        tempo_jump_threshold = config.tempo_jump_threshold
+        tempo_jump_penalty = config.tempo_jump_penalty
     required_columns = {"tempo"}
     missing_columns = required_columns.difference(df.columns)
     if missing_columns:
@@ -200,6 +243,9 @@ def compute_transition_cost_matrix(
     else:
         meter_costs = np.zeros_like(tempo_costs)
     rhythm_costs = tempo_costs + meter_penalty * meter_costs
+    if tempo_jump_threshold > 0.0:
+        excess = np.maximum(0.0, tempo_costs - tempo_jump_threshold)
+        rhythm_costs = rhythm_costs + tempo_jump_penalty * excess
 
     if {"camelot_number", "camelot_mode"}.issubset(df.columns):
         tonality_costs = _camelot_tonality_costs(df)

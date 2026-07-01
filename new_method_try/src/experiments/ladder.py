@@ -16,6 +16,8 @@ import numpy as np
 import pandas as pd
 
 from src.arcs import TargetArcConfig, create_target_arc
+import time
+
 from src.baselines import (
     ArcAssignmentBaseline,
     FlexerInterpolationBaseline,
@@ -24,6 +26,7 @@ from src.baselines import (
     RandomBaseline,
     TransitionGreedyBaseline,
 )
+from src.baselines.mm_beam import MMBeamConfig
 from src.baselines.flexer_interp import relative_positions
 from src.bibs import BIBS, BIBSConfig
 from src.bottleneck_detector import BottleneckConfig, BottleneckDetector
@@ -101,7 +104,12 @@ def _run_bibs(config: BIBSConfig, inp: dict) -> list[int]:
     )
 
 
-def run_ladder(genre: str = "pop", pool_size: int = 150, seed: int = 42) -> pd.DataFrame:
+def run_ladder(
+    genre: str = "pop",
+    pool_size: int = 150,
+    seed: int = 42,
+    include_tempo_variants: bool = False,
+) -> pd.DataFrame:
     """Run all methods on one pool and return a comparison table."""
     inp = build_inputs(genre, pool_size, seed)
     track_pool = inp["track_pool"]
@@ -128,7 +136,13 @@ def run_ladder(genre: str = "pop", pool_size: int = 150, seed: int = 42) -> pd.D
 
     rows: list[dict[str, object]] = []
 
-    def add_row(name: str, playlist: list[int], arc_optimized: bool, diversity=np.nan):
+    def add_row(
+        name: str,
+        playlist: list[int],
+        arc_optimized: bool,
+        diversity=np.nan,
+        wall_time_s=np.nan,
+    ):
         metrics = evaluate_full(playlist)
         rows.append(
             {
@@ -143,40 +157,23 @@ def run_ladder(genre: str = "pop", pool_size: int = 150, seed: int = 42) -> pd.D
                 "dtw_shape": metrics["dtw_shape"],
                 "ratio_adherence_rmse": metrics["ratio_adherence_rmse"],
                 "diversity": diversity,
+                "wall_time_s": wall_time_s,
             }
         )
 
+    def timed_add(name: str, fn, arc_optimized: bool, diversity=np.nan):
+        t0 = time.perf_counter()
+        playlist = fn()
+        elapsed = time.perf_counter() - t0
+        add_row(name, playlist, arc_optimized, diversity=diversity, wall_time_s=elapsed)
+
     # --- baselines ---
-    add_row(
-        "random",
-        RandomBaseline(seed=seed).generate(number_of_tracks, start_index, end_index),
-        False,
-    )
-    add_row(
-        "transition_greedy",
-        TransitionGreedyBaseline().generate(c_trans, start_index, end_index, graph_data),
-        False,
-    )
-    add_row(
-        "arc_assignment",
-        ArcAssignmentBaseline().generate(c_arc, start_index, end_index),
-        True,
-    )
-    add_row(
-        "flexer_interp",
-        FlexerInterpolationBaseline().generate(track_pool, start_index, end_index),
-        True,
-    )
-    add_row(
-        "forward_beam",
-        ForwardBeamBaseline().generate(c_arc, c_trans, start_index, end_index),
-        True,
-    )
-    add_row(
-        "mm_beam",
-        MMBeamBaseline().generate(c_arc, c_trans, start_index, end_index),
-        True,
-    )
+    timed_add("random", lambda: RandomBaseline(seed=seed).generate(number_of_tracks, start_index, end_index), False)
+    timed_add("transition_greedy", lambda: TransitionGreedyBaseline().generate(c_trans, start_index, end_index, graph_data), False)
+    timed_add("arc_assignment", lambda: ArcAssignmentBaseline().generate(c_arc, start_index, end_index), True)
+    timed_add("flexer_interp", lambda: FlexerInterpolationBaseline().generate(track_pool, start_index, end_index), True)
+    timed_add("forward_beam", lambda: ForwardBeamBaseline().generate(c_arc, c_trans, start_index, end_index), True)
+    timed_add("mm_beam", lambda: MMBeamBaseline().generate(c_arc, c_trans, start_index, end_index), True)
     greedy = GreedyPlaylistBaseline(GreedyBaselineConfig()).generate(
         c_arc, c_trans, start_index=start_index, end_index=end_index,
         transition_graph=graph_data,
@@ -188,12 +185,8 @@ def run_ladder(genre: str = "pop", pool_size: int = 150, seed: int = 42) -> pd.D
     bibs_current = _run_bibs(BIBSConfig(), inp)
     add_row("bibs_current", bibs_current, True)
     add_row("bibs_current+repair", repair(bibs_current), True)
-    add_row(
-        "bibs_eligibility",
-        _run_bibs(BIBSConfig(bottleneck_mode="eligibility"), inp),
-        True,
-    )
-    add_row("bibs_commit", _run_bibs(BIBSConfig(commit_beams=True), inp), True)
+    timed_add("bibs_eligibility", lambda: _run_bibs(BIBSConfig(bottleneck_mode="eligibility"), inp), True)
+    timed_add("bibs_commit", lambda: _run_bibs(BIBSConfig(commit_beams=True), inp), True)
 
     # --- BIBS stochastic (multi-seed: report mean metrics + diversity) ---
     def stochastic_block(name: str, base_config: dict, with_repair: bool) -> None:
@@ -222,6 +215,7 @@ def run_ladder(genre: str = "pop", pool_size: int = 150, seed: int = 42) -> pd.D
                 "dtw_shape": mean["dtw_shape"],
                 "ratio_adherence_rmse": mean["ratio_adherence_rmse"],
                 "diversity": diversity,
+                "wall_time_s": np.nan,
             }
         )
 
@@ -231,6 +225,38 @@ def run_ladder(genre: str = "pop", pool_size: int = 150, seed: int = 42) -> pd.D
         {"bottleneck_mode": "eligibility"},
         with_repair=True,
     )
+
+    if include_tempo_variants:
+        # Tempo-aware BIBS: BPM-jump penalty (threshold 0.30)
+        timed_add(
+            "bibs_tempo_aware",
+            lambda: _run_bibs(BIBSConfig(tempo_jump_threshold=0.30, tempo_jump_penalty=3.0), inp),
+            True,
+        )
+        timed_add(
+            "bibs_tempo_aware+repair",
+            lambda: repair(_run_bibs(BIBSConfig(tempo_jump_threshold=0.30, tempo_jump_penalty=3.0), inp)),
+            True,
+        )
+
+        # Alpha-boost: heavier rhythm weight in C_trans
+        c_trans_alpha2 = compute_transition_cost_matrix(track_pool, alpha=2.0, beta=0.4, gamma=0.6)
+        inp_alpha2 = {**inp, "c_trans": c_trans_alpha2}
+        timed_add("bibs_alpha2", lambda: _run_bibs(BIBSConfig(), inp_alpha2), True)
+        timed_add(
+            "mm_beam_alpha2",
+            lambda: MMBeamBaseline().generate(c_arc, c_trans_alpha2, start_index, end_index),
+            True,
+        )
+
+        # Stochastic MM beam
+        timed_add(
+            "mm_beam_stochastic",
+            lambda: MMBeamBaseline(config=MMBeamConfig(stochastic=True, random_seed=seed)).generate(
+                c_arc, c_trans, start_index, end_index
+            ),
+            True,
+        )
 
     return pd.DataFrame(rows)
 

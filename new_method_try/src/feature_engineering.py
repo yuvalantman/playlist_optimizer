@@ -20,7 +20,13 @@ class EnergyValenceConfig:
 
 @dataclass(frozen=True)
 class StartEndSelectionConfig:
-    """Configuration for deterministic start and end track selection."""
+    """Configuration for deterministic start and end track selection.
+
+    endpoint_mode: "quantile" (default) picks EV-extreme tracks then snaps the
+        trajectory to them. "trajectory_fit" defines the trajectory from the pool's
+        natural EV range first, then picks the tracks that best fit positions 0 and
+        L-1 of that un-snapped trajectory.
+    """
 
     min_ev_gap: float = 0.35
     preferred_ev_gap: float = 0.60
@@ -29,6 +35,7 @@ class StartEndSelectionConfig:
     transition_potential_k: int = 20
     transition_potential_weight: float = 0.25
     random_seed: int = 42
+    endpoint_mode: str = "quantile"  # "quantile" | "trajectory_fit"
 
 
 @dataclass(frozen=True)
@@ -104,12 +111,12 @@ def create_linear_target_arc(
     return np.linspace(start_value, end_value, num=length, dtype=float)
 
 
-def select_start_end_tracks(
+def _select_start_end_quantile(
     df: pd.DataFrame,
-    c_trans: np.ndarray | None = None,
-    config: StartEndSelectionConfig = StartEndSelectionConfig(),
+    c_trans: np.ndarray | None,
+    config: "StartEndSelectionConfig",
 ) -> tuple[int, int]:
-    """Select deterministic low-EV start and high-EV end tracks."""
+    """Original quantile-based start/end selection."""
     if "EV_score" not in df.columns:
         raise ValueError("DataFrame must contain an EV_score column.")
     if not 0 <= config.start_quantile < config.end_quantile <= 1:
@@ -168,6 +175,87 @@ def select_start_end_tracks(
         return float(score), start, end
 
     return min(valid_pairs, key=pair_score)
+
+
+def _select_trajectory_fit(
+    df: pd.DataFrame,
+    config: "StartEndSelectionConfig",
+) -> tuple[int, int]:
+    """Trajectory-first endpoint selection.
+
+    Defines the target trajectory from the pool's Q05-Q95 EV range (no endpoint
+    snapping), computes a preliminary arc cost matrix, then picks the tracks that
+    best fit the first and last positions of that trajectory.  The caller still
+    runs create_target_arc with endpoint-snapping afterward, so the final arc is
+    self-consistent.
+    """
+    ev_scores = pd.to_numeric(df["EV_score"], errors="coerce").to_numpy(dtype=float)
+    n = len(ev_scores)
+    ev_low = float(np.quantile(ev_scores, 0.05))
+    ev_high = float(np.quantile(ev_scores, 0.95))
+    prelim_arc = np.linspace(ev_low, ev_high, n)
+    arc_costs = np.abs(ev_scores[:, np.newaxis] - prelim_arc[np.newaxis, :])
+
+    start_candidates = np.where(ev_scores <= np.median(ev_scores))[0]
+    end_candidates = np.where(ev_scores > np.median(ev_scores))[0]
+
+    start_scores = arc_costs[start_candidates, 0]
+    end_scores = arc_costs[end_candidates, n - 1]
+    start_order = start_candidates[np.argsort(start_scores)]
+    end_order = end_candidates[np.argsort(end_scores)]
+
+    for s in start_order:
+        for e in end_order:
+            if s != e and ev_scores[e] - ev_scores[s] >= config.min_ev_gap:
+                return int(s), int(e)
+
+    raise ValueError(
+        "trajectory_fit: no valid start/end pair satisfies min_ev_gap. "
+        "Try lowering min_ev_gap or switching to endpoint_mode='quantile'."
+    )
+
+
+def _select_ev_proximity(
+    df: pd.DataFrame,
+) -> tuple[int, int]:
+    """Simplest endpoint selection: closest EV to the natural trajectory endpoints.
+
+    Computes a preliminary linear arc from the pool's Q05-Q95 EV range, then picks:
+      start = argmin |EV[track] - arc[0]|
+      end   = argmin |EV[track] - arc[N-1]|  (with end ≠ start)
+    No minimum EV gap enforced — just pure EV proximity. This is the fairest way to
+    anchor the trajectory when you want the playlist to literally begin and end at the
+    natural low/high energy of the pool.
+    """
+    ev_scores = pd.to_numeric(df["EV_score"], errors="coerce").to_numpy(dtype=float)
+    n = len(ev_scores)
+    ev_low = float(np.quantile(ev_scores, 0.05))
+    ev_high = float(np.quantile(ev_scores, 0.95))
+    start_ev = ev_low
+    end_ev = ev_high
+
+    start_dist = np.abs(ev_scores - start_ev)
+    end_dist = np.abs(ev_scores - end_ev)
+
+    start_order = np.argsort(start_dist, kind="stable")
+    start_index = int(start_order[0])
+
+    end_candidates = np.argsort(end_dist, kind="stable")
+    end_index = int(next(i for i in end_candidates if i != start_index))
+    return start_index, end_index
+
+
+def select_start_end_tracks(
+    df: pd.DataFrame,
+    c_trans: np.ndarray | None = None,
+    config: "StartEndSelectionConfig" = StartEndSelectionConfig(),
+) -> tuple[int, int]:
+    """Dispatch to the appropriate endpoint selection strategy."""
+    if config.endpoint_mode == "trajectory_fit":
+        return _select_trajectory_fit(df, config)
+    if config.endpoint_mode == "ev_proximity":
+        return _select_ev_proximity(df)
+    return _select_start_end_quantile(df, c_trans, config)
 
 
 def create_target_arc_from_tracks(
